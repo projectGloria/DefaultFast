@@ -1,35 +1,62 @@
+//! DefaultFast: set and repair Windows default apps.
+//!
+//! `unsafe` is denied crate-wide and only re-allowed inside the thin OS wrapper modules
+//! (`registry::win`, `shell`, `window`).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(unsafe_code)]
-mod app_scan;
-mod assoc;
-mod cache;
-mod ffi;
-mod hash;
+
+mod discovery;
+mod error;
+mod logfile;
 mod model;
-mod registry_scan;
+mod registry;
 mod search;
-mod ui;
+mod shell;
+
+use std::time::Instant;
 
 fn main() {
-    let start = std::time::Instant::now();
-    if std::env::args().any(|a| a == "--benchmark") {
-        ui::benchmark();
-        return;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--diagnose") => diagnose(),
+        _ => diagnose(),
     }
-    if std::env::args().any(|a| a == "--diagnose") {
-        ui::diagnose();
-        return;
+}
+
+/// Builds the index headlessly and writes timings/counts to diagnostics.txt.
+fn diagnose() {
+    let _com = shell::Com::init();
+    let reg = registry::WinRegistry;
+    let t0 = Instant::now();
+    let (file_types, protocols) = discovery::scan_types(&reg, &|| false);
+    let t1 = Instant::now();
+    let mut programs = discovery::scan_programs(&reg, &file_types, &|| false);
+    let t2 = Instant::now();
+    discovery::scan_shell(&mut programs, &|| false);
+    let t3 = Instant::now();
+    let mut index = model::Index { programs, file_types, protocols, complete: true };
+    discovery::sort(&mut index);
+    let mut results = search::Results::default();
+    let t4 = Instant::now();
+    for q in ["v", "vl", "vlc", "notepad", "pdf", ".bat", "http", "chrome", "zzzz"] {
+        search::run(&index, q, &mut results);
     }
-    if std::env::args().any(|a| a == "--self-test-association") {
-        let result = assoc::self_test();
-        let report = format!("{result:?}\n");
-        let _ = cache::atomic_write("self-test.txt", report.as_bytes());
-        if result.is_err() {
-            std::process::exit(1);
-        }
-        return;
+    let per_query = t4.elapsed() / 9;
+    let mut report = format!(
+        "file_types={} protocols={} programs={} with_supports={}\n\
+         scan_types_ms={} scan_programs_ms={} scan_shell_ms={} search_us_per_query={}\n",
+        index.file_types.len(),
+        index.protocols.len(),
+        index.programs.len(),
+        index.programs.iter().filter(|p| !p.supports.is_empty()).count(),
+        (t1 - t0).as_millis(),
+        (t2 - t1).as_millis(),
+        (t3 - t2).as_millis(),
+        per_query.as_micros(),
+    );
+    for p in &index.programs {
+        report.push_str(&format!("{} | {} | {} | {} targets\n", p.name, p.exe, p.aumid, p.supports.len()));
     }
-    if let Err(e) = ffi::ui::run(start) {
-        ffi::ui::fatal(&e);
-    }
+    let path = logfile::data_dir().join("diagnostics.txt");
+    let _ = std::fs::write(&path, report);
 }
