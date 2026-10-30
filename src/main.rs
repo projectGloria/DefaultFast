@@ -6,15 +6,21 @@
 #![deny(unsafe_code)]
 
 mod actions;
+mod backup;
+mod defaults;
 mod discovery;
+mod elevated;
 mod error;
 mod logfile;
 mod model;
 mod probe;
 mod registry;
+mod repair_ui;
 mod search;
+mod selftest;
 mod shell;
 mod ui;
+mod userchoice;
 mod window;
 mod worker;
 
@@ -24,11 +30,18 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--diagnose") => diagnose(),
+        Some("--self-test") => std::process::exit(selftest::run()),
         Some("--startup-probe") => run_ui(true, None),
         // `DefaultFast.exe .pdf` opens with the search pre-filled.
         Some(q) if !q.starts_with("--") => run_ui(false, Some(args.join(" "))),
         _ => run_ui(false, None),
     }
+}
+
+/// Tells Explorer associations changed. A no-op in unit tests (they use MemRegistry).
+pub fn shell_notify() {
+    #[cfg(not(test))]
+    shell::notify_assoc_changed();
 }
 
 fn run_ui(probe: bool, query: Option<String>) {
@@ -70,6 +83,14 @@ fn diagnose() {
         (t3 - t2).as_millis(),
         per_query.as_micros(),
     );
+    let sid = shell::user_sid().unwrap_or_default();
+    let (algo, valid, invalid) = userchoice::algorithm_status(&reg, &sid);
+    report.push_str(&format!("userchoice_hash={algo:?} valid={valid} invalid={invalid} ucpd_running={}
+", shell::ucpd_running()));
+    for t in [".txt", ".pdf", ".html", ".mp4", "http", "https", "mailto"] {
+        report.push_str(&format!("  {t}: legacy={:?} latest={} effective={:?}
+", userchoice::validate(&reg, t, &sid), userchoice::uses_latest(&reg, t), shell::assoc_query(t, shell::AssocStr::ProgId)));
+    }
     for p in &index.programs {
         report.push_str(&format!("{} | {} | {} | {} targets\n", p.name, p.exe, p.aumid, p.supports.len()));
     }

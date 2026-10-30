@@ -4,6 +4,11 @@ Versions follow the rule in the project brief: minor change -> bump the pre-rele
 medium change -> beta, major change -> next version number. The version lives only in
 `Cargo.toml`.
 
+## 0.1.0-beta.2 — 2026-10-30 — medium
+UserChoice writer (legacy hash, pure-Rust MD5, PS-SFTA vectors, live check against this
+machine's own keys), .reg backups before every write, Shell verification with per-target
+rollback, Settings fallback for UCPD / UserChoiceLatest, Undo toast, Browse, --self-test.
+
 ## 0.1.0-beta.1 — 2026-10-30 — medium
 Slint UI with custom Windows 11 top bar on a real native frame (Snap Layouts, resize borders,
 shadow, rounded corners), grouped fuzzy search with lazy icons, program and file-type/protocol

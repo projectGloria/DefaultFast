@@ -954,3 +954,15 @@ fn add_target(text: &str) {
         toast("Store apps can only open the file types they declare. Use Windows Settings for this app.", 1, false, false);
     }
 }
+
+/// RegisteredApplications name for the Settings deep link of a candidate app.
+pub(crate) fn registered_for(exe: &str, aumid: &str) -> Option<(String, bool)> {
+    with_state(|s, _| {
+        s.index
+            .programs
+            .iter()
+            .find(|p| (!exe.is_empty() && p.exe.eq_ignore_ascii_case(exe)) || (!aumid.is_empty() && p.aumid == aumid))
+            .map(|p| (p.registered_name.clone(), p.registered_machine))
+    })
+    .flatten()
+}
