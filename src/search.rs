@@ -19,27 +19,44 @@ pub fn score(text: &str, query: &str) -> i32 {
         let boundary = !text.as_bytes()[pos - 1].is_ascii_alphanumeric();
         return if boundary { 80_000 } else { 60_000 } - pos.min(1000) as i32 - text.len().min(1000) as i32 / 4;
     }
-    // Subsequence: every query char in order. Reject matches that are mostly gaps, otherwise
-    // "bat" matches every long string containing b…a…t.
-    let mut q = query.chars();
-    let mut want = q.next();
-    let (mut matched, mut gaps, mut run, mut best_run) = (0i32, 0i32, 0i32, 0i32);
-    for c in text.chars() {
-        let Some(w) = want else { break };
-        if c == w {
-            matched += 1;
-            run += 1;
-            best_run = best_run.max(run);
-            want = q.next();
-        } else if matched > 0 {
-            gaps += 1;
-            run = 0;
-        }
-    }
-    if want.is_some() || gaps > matched * 3 {
+    // Subsequence ("ntpd" -> notepad): must start at a word start and stay compact (at most
+    // one skipped char per query char, plus one). Otherwise "vlc" matches
+    // "Equalizer APO De(v)ice Se(l)e(c)tor" and fuzzy results drown the real ones.
+    let qlen = query.chars().count() as i32;
+    if qlen < 2 {
         return 0;
     }
-    10_000 + best_run * 50 + matched * 8 - gaps * 4
+    let first = query.chars().next().unwrap_or_default();
+    let mut prev_alnum = false;
+    let mut best = 0;
+    for (start, c) in text.char_indices() {
+        let word_start = !prev_alnum;
+        prev_alnum = c.is_alphanumeric();
+        if c != first || !word_start {
+            continue;
+        }
+        let mut q = query.chars().skip(1);
+        let mut want = q.next();
+        let (mut span, mut run, mut best_run) = (1i32, 1i32, 1i32);
+        for c in text[start + c.len_utf8()..].chars() {
+            let Some(w) = want else { break };
+            span += 1;
+            if span > qlen * 2 + 1 {
+                break;
+            }
+            if c == w {
+                run += 1;
+                best_run = best_run.max(run);
+                want = q.next();
+            } else {
+                run = 0;
+            }
+        }
+        if want.is_none() && span <= qlen * 2 + 1 {
+            best = best.max(10_000 + best_run * 50 - (span - qlen) * 20);
+        }
+    }
+    best
 }
 
 /// Best of the primary field (name / extension) and the secondary search text; primary
@@ -141,6 +158,7 @@ mod tests {
         assert!(score("batch file", "bat") > score("windows batch file", "bat"));
         assert!(score("windows batch file", "bat") > score("acrobat", "bat"));
         assert!(score("acrobat", "bat") > score("b-a-t", "bat"));
+        assert_eq!(score("equalizer apo device selector", "vlc"), 0, "fuzzy must be compact and word-anchored");
         assert!(score("b-a-t", "bat") > 0);
         assert_eq!(score("pdf", "bat"), 0);
         assert_eq!(score("bxxxxxxxxxxxxaxxxxxxxxxt", "bat"), 0, "mostly gaps");

@@ -504,14 +504,24 @@ pub fn ucpd_running() -> bool {
     }
 }
 
-/// (working set, peak working set) in bytes.
-pub fn memory() -> (usize, usize) {
-    let mut m = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
-    // SAFETY: `m` is a correctly sized out struct for the current process pseudo-handle.
-    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) }.is_ok() {
-        (m.WorkingSetSize, m.PeakWorkingSetSize)
+/// (working set, peak working set, private bytes) in bytes.
+pub fn memory() -> (usize, usize, usize) {
+    let mut m = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+    // SAFETY: PROCESS_MEMORY_COUNTERS_EX starts with PROCESS_MEMORY_COUNTERS and `cb` tells
+    // the API which layout it got.
+    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&mut m as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), m.cb) }.is_ok() {
+        (m.WorkingSetSize, m.PeakWorkingSetSize, m.PrivateUsage)
     } else {
-        (0, 0)
+        (0, 0, 0)
+    }
+}
+
+/// Drops pages the idle app no longer touches (Shell DLL code used only by the one-off
+/// Start Menu / AppsFolder scan). They fault back in cheaply if needed again.
+pub fn trim_working_set() {
+    // SAFETY: current-process pseudo-handle.
+    unsafe {
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
     }
 }
 

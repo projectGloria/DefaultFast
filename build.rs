@@ -14,6 +14,10 @@ fn main() {
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Fluent style: the native Windows 11 look for std widgets.
+    slint_build::compile_with_config("ui/app.slint", slint_build::CompilerConfiguration::new().with_style("fluent".into()))
+        .expect("compile ui/app.slint");
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
