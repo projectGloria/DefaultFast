@@ -4,6 +4,11 @@ Versions follow the rule in the project brief: minor change -> bump the pre-rele
 medium change -> beta, major change -> next version number. The version lives only in
 `Cargo.toml`.
 
+## 0.1.0-beta.4 — 2026-10-30 — minor
+Polish: version tooltip, Enter moves focus into the detail list, Esc returns to search, silent
+icon glyphs for screen readers, compact repair/history buttons; README with measured budgets,
+manual test plan, measure script, CLAUDE.md.
+
 ## 0.1.0-beta.3 — 2026-10-30 — medium
 Repair view (known-good table, no-handler / wrong-class / dangling / missing-exe / bad-hash
 checks, startup scan), on-demand elevated helper (--elevated-fix / --elevated-set) with UAC

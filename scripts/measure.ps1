@@ -1,25 +1,28 @@
-param([string]$Exe=(Join-Path $PSScriptRoot '..\dist\DefaultPicker.exe'),[ValidateRange(1,20)][int]$Runs=5,[switch]$Software)
-$ErrorActionPreference='Stop'
-$Exe=(Resolve-Path -LiteralPath $Exe).Path
-$dataDir=Join-Path $env:LOCALAPPDATA 'DefaultPicker'
-$samples=@()
-for($i=0;$i -lt $Runs;$i++){
-    $flags=@('--startup-probe')
-    if($Software){$flags+='--software'}
-    $timer=[Diagnostics.Stopwatch]::StartNew()
-    $process=Start-Process -FilePath $Exe -ArgumentList $flags -PassThru
-    if(!$process.WaitForExit(15000)){throw "Startup probe did not finish within 15s (PID $($process.Id)); inspect its window."}
-    $timer.Stop()
-    if($process.ExitCode -ne 0){throw "Probe exited with $($process.ExitCode)."}
-    $values=@{}
-    Get-Content -LiteralPath (Join-Path $dataDir 'startup.txt') | ForEach-Object {
-        if($_ -match '^([a-z_]+)=(\d+)$'){$values[$Matches[1]]=[long]$Matches[2]}
+# Measures DefaultFast against its budgets on this machine.
+# Usage: .\scripts\measure.ps1 [-Runs 5] [-Exe .\target\release\DefaultFast.exe]
+# Each run launches with --startup-probe, which records first-frame time, idle working set
+# (index built, window untouched) and working set after a real search, then exits.
+param([string]$Exe = (Join-Path $PSScriptRoot '..\target\release\DefaultFast.exe'), [ValidateRange(1, 20)][int]$Runs = 5)
+$ErrorActionPreference = 'Stop'
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
+$report = Join-Path $env:LOCALAPPDATA 'DefaultFast\startup.txt'
+$rows = @()
+for ($i = 1; $i -le $Runs; $i++) {
+    Remove-Item -LiteralPath $report -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $Exe -ArgumentList '--startup-probe' -PassThru
+    if (!$p.WaitForExit(30000)) { $p.Kill(); throw "Probe run $i did not finish within 30 s." }
+    $v = @{}
+    Get-Content -LiteralPath $report | ForEach-Object { if ($_ -match '^([a-z_]+)=([\d.]+)$') { $v[$Matches[1]] = [double]$Matches[2] } }
+    $rows += [pscustomobject]@{
+        Run              = $i
+        FirstFrameMs     = $v.first_frame_ms
+        IdleWsMB         = [math]::Round($v.idle_working_set_bytes / 1MB, 1)
+        AfterSearchWsMB  = [math]::Round($v.after_search_working_set_bytes / 1MB, 1)
+        AfterSearchPrivMB= [math]::Round($v.after_search_private_bytes / 1MB, 1)
+        PeakWsMB         = [math]::Round($v.peak_working_set_bytes / 1MB, 1)
+        SearchRenderMs   = [math]::Round($v.search_and_render_us / 1000, 2)
     }
-    $samples += [pscustomobject]@{Run=$i+1;ProcessLifetimeMs=[math]::Round($timer.Elapsed.TotalMilliseconds,2);FirstNativeFrameUs=$values.entry_to_first_native_paint_us;FirstGpuFrameUs=$values.entry_to_first_gpu_paint_us;WorkingSetBytes=$values.working_set_at_exit_bytes;PeakWorkingSetBytes=$values.peak_working_set_bytes}
 }
-$samples | Format-Table -AutoSize
-$samples | Export-Csv -LiteralPath (Join-Path $dataDir 'startup-samples.csv') -NoTypeInformation
-$process=Start-Process -FilePath $Exe -ArgumentList '--benchmark' -Wait -PassThru
-if($process.ExitCode -ne 0){throw 'Filter benchmark failed.'}
-Get-Content -LiteralPath (Join-Path $dataDir 'benchmark.txt')
-Write-Output 'These are repeated process launches with normal OS caching, not an OS cold-cache experiment. Lifetime includes shutdown and file flushes.'
+$rows | Format-Table -AutoSize
+"Binary size: {0:N2} MB" -f ((Get-Item -LiteralPath $Exe).Length / 1MB)
+'Warm launches (OS file cache populated); not a cold-boot measurement.'

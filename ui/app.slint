@@ -77,6 +77,8 @@ component Glyph inherits Text {
     horizontal-alignment: center;
     vertical-alignment: center;
     accessible-role: none;
+    // Icon-font code points are private-use characters: never read them out.
+    accessible-label: "";
 }
 
 // Windows 11 style button. kind: 0 standard, 1 accent, 2 subtle (hyperlink-ish).
@@ -321,11 +323,10 @@ component HandlerItem inherits Rectangle {
                 overflow: elide;
             }
         }
-        if data.is-current: Text {
-            text: "\u{E73E} Current";
-            font-size: 12px;
-            color: Theme.ok;
-            vertical-alignment: center;
+        if data.is-current: HorizontalLayout {
+            spacing: 4px;
+            Glyph { text: "\u{E73E}"; font-size: 12px; color: Theme.ok; }
+            Text { text: "Current"; font-size: 12px; color: Theme.ok; vertical-alignment: center; }
         }
         if !data.is-current: VerticalLayout {
             alignment: center;
@@ -421,6 +422,8 @@ export component AppWindow inherits Window {
     in property <string> confirm-ok;
     in property <bool> confirm-shield;
     in-out property <bool> about-visible;
+    // Bumped by Rust after Enter opens a result: moves keyboard focus into the detail list.
+    in property <int> detail-focus;
 
     callback query-edited(string);
     callback move-selection(int);
@@ -494,7 +497,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if (e.text == Key.Escape) {
-                root.escape-pressed();
+                // From the detail pane: back to the search box, keeping the query.
                 root.focus-search();
                 return accept;
             }
@@ -701,6 +704,8 @@ export component AppWindow inherits Window {
                             color: Theme.text-2;
                         }
                         support-scope := FocusScope {
+                            property <int> req: root.detail-focus;
+                            changed req => { self.focus(); }
                             vertical-stretch: 1;
                             accessible-role: list;
                             accessible-label: "File types and protocols";
@@ -779,6 +784,8 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Apps that can open it"; font-size: 13px; font-weight: 600; color: Theme.text-2; }
                         handler-scope := FocusScope {
+                            property <int> req: root.detail-focus;
+                            changed req => { self.focus(); }
                             vertical-stretch: 1;
                             accessible-role: list;
                             accessible-label: "Apps that can open it";
@@ -914,6 +921,20 @@ export component AppWindow inherits Window {
                 Btn { kind: 2; font-size: 12px; height: 26px; glyph: "\u{E81C}"; text: "History"; clicked => { root.show-history(); } }
                 Btn { kind: 2; font-size: 12px; height: 26px; glyph: "\u{E946}"; text: "About"; clicked => { root.about-visible = true; } }
             }
+        }
+
+        // ---------------------------------------------------------------- version tooltip
+        if icon-ta.has-hover: Rectangle {
+            x: 8px; y: 38px;
+            width: tip.preferred-width + 16px;
+            height: 26px;
+            border-radius: 4px;
+            background: Theme.dark ? #2c2c2c : #ffffff;
+            border-width: 1px;
+            border-color: Theme.stroke-strong;
+            drop-shadow-blur: 8px;
+            drop-shadow-color: #00000033;
+            tip := Text { text: "DefaultFast " + root.version; font-size: 12px; color: Theme.text; }
         }
 
         // ---------------------------------------------------------------- toast

@@ -868,6 +868,12 @@ fn wire_callbacks(app: &AppWindow) {
     });
     app.on_open_selected(|| {
         with_state(|s, app| open_row(s, app, app.get_selected()));
+        // Next turn, once the detail view exists: move focus into its list (Space/arrows).
+        Timer::single_shot(Duration::ZERO, || {
+            if let Some(app) = main_app() {
+                app.set_detail_focus(app.get_detail_focus() + 1);
+            }
+        });
     });
     app.on_escape_pressed(|| {
         with_state(|s, app| {
