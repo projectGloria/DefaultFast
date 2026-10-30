@@ -401,8 +401,10 @@ pub fn run(probe: bool, query: Option<String>) -> Result<(), slint::PlatformErro
         if let Some(app) = weak.upgrade() {
             app.set_is_max(window::is_maximized());
             app.invoke_focus_search();
-            if let Some(q) = query {
-                app.invoke_example(q.into());
+            match query.as_deref() {
+                Some("--repair") => app.invoke_show_repair(),
+                Some(q) => app.invoke_example(q.into()),
+                None => {}
             }
         }
         if probe {
@@ -758,14 +760,6 @@ pub(crate) fn program(key: &str) -> Option<crate::model::Program> {
 pub(crate) fn current_target() -> Option<(String, Vec<Candidate>)> {
     with_state(|s, _| match &s.view {
         View::Target { target, candidates } => Some((target.clone(), candidates.clone())),
-        _ => None,
-    })
-    .flatten()
-}
-
-pub(crate) fn current_program_key() -> Option<String> {
-    with_state(|s, _| match &s.view {
-        View::Program { key, .. } => Some(key.clone()),
         _ => None,
     })
     .flatten()

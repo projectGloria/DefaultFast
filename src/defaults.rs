@@ -41,6 +41,7 @@ pub struct Report {
     pub backup: Option<std::path::PathBuf>,
 }
 
+#[cfg(test)]
 impl Report {
     pub fn done(&self) -> usize {
         self.results.iter().filter(|r| r.1 == Status::Done).count()

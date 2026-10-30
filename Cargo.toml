@@ -2,7 +2,7 @@
 name = "defaultfast"
 # Single source of truth for the version: shown in About, the title-bar tooltip and the
 # exe's VERSIONINFO resource. Bump on every change (see CHANGELOG.md).
-version = "0.1.0-beta.2"
+version = "0.1.0-beta.3"
 edition = "2021"
 rust-version = "1.88"
 description = "Set and repair Windows default apps"

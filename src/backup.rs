@@ -260,6 +260,8 @@ pub struct Entry {
     pub summary: String,
     pub created: String,
     pub undone: bool,
+    /// Touches HKLM, so restoring it needs the elevated helper (UI warns first).
+    pub machine: bool,
 }
 
 /// Newest first. Undone backups are renamed `*.undone.reg`.
@@ -276,9 +278,10 @@ pub fn list(dir: &Path) -> Vec<Entry> {
     files
         .into_iter()
         .filter_map(|path| {
-            let (summary, created, _) = load(&path).ok()?;
+            let (summary, created, ops) = load(&path).ok()?;
             let undone = path.to_string_lossy().ends_with(".undone.reg");
-            Some(Entry { path, summary, created, undone })
+            let machine = ops.iter().any(|o| o.hive() == Hive::LocalMachine);
+            Some(Entry { path, summary, created, undone, machine })
         })
         .collect()
 }

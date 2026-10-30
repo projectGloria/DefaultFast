@@ -830,6 +830,7 @@ export component AppWindow inherits Window {
                             spacing: 8px;
                             Btn { kind: 1; text: "Fix all (" + root.fixable-count + ")"; enabled: root.fixable-count > 0 && !root.busy; clicked => { root.fix-all(); } }
                             Btn { text: "Check again"; enabled: !root.busy; clicked => { root.run-health(); } }
+                            Rectangle { horizontal-stretch: 1; }
                         }
                         ListView {
                             vertical-stretch: 1;

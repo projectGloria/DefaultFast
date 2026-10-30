@@ -13,12 +13,16 @@ use std::{cell::RefCell, path::PathBuf};
 
 pub enum Action {
     Health,
+    Fix(Vec<crate::repair::Issue>),
+    ListHistory,
     Apply { req: Request, settings_uri: String },
     Restore { path: PathBuf, undo: bool },
 }
 
 pub enum Outcome {
-    Health,
+    Health(Vec<(crate::repair::Issue, bool)>),
+    Fixed { result: Result<String, String>, backup: Option<PathBuf> },
+    History(Vec<backup::Entry>),
     Applied { report: Report, app_name: String, settings_uri: String },
     Restored(Result<String, String>),
 }
@@ -44,7 +48,21 @@ fn verify(target: &str, prog_id: &str, exe: &str) -> bool {
 
 pub fn run(reg: &dyn Registry, action: Action) -> Outcome {
     match action {
-        Action::Health => Outcome::Health,
+        Action::Health => Outcome::Health(match shell::user_sid() {
+            Ok(sid) => crate::repair::scan(reg, &sid, &|p| std::path::Path::new(p).exists(), &shell::expand_env)
+                .into_iter()
+                .map(|i| {
+                    let admin = crate::repair::needs_machine(reg, &i).is_some();
+                    (i, admin)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }),
+        Action::Fix(issues) => {
+            let (result, backup) = fix(reg, &issues);
+            Outcome::Fixed { result, backup }
+        }
+        Action::ListHistory => Outcome::History(backup::list(&backup::dir())),
         Action::Apply { req, settings_uri } => {
             let report = match shell::user_sid() {
                 Ok(sid) => defaults::apply(reg, &verify, &sid, &req, &shell::file_stamp(), &shell::timestamp(), &backup::dir()),
@@ -95,7 +113,18 @@ pub fn on_reply(reply: crate::worker::Reply) {
         app.set_busy(false);
     }
     match outcome {
-        Outcome::Health => crate::repair_ui::health_done(),
+        Outcome::Health(issues) => crate::repair_ui::health_done(issues),
+        Outcome::History(entries) => crate::repair_ui::history_loaded(entries),
+        Outcome::Fixed { result, backup } => {
+            LAST_BACKUP.with(|b| *b.borrow_mut() = backup.clone());
+            match result {
+                Ok(msg) => ui::toast(&msg, 0, backup.is_some(), false),
+                Err(e) => ui::toast(&e, 1, backup.is_some(), false),
+            }
+            crate::repair_ui::run_health();
+            crate::repair_ui::history_changed();
+            ui::refresh_detail();
+        }
         Outcome::Applied { report, app_name, settings_uri } => {
             let pick = |f: fn(&Status) -> bool| report.results.iter().filter(|r| f(&r.1)).map(|r| r.0.clone()).collect::<Vec<_>>();
             let done = pick(|s| *s == Status::Done);
@@ -261,4 +290,35 @@ pub fn wire(app: &ui::AppWindow) {
         }
     });
     crate::repair_ui::wire(app);
+}
+
+/// Backup, per-user fixes, then one UAC prompt for any HKLM defaults, then verification.
+fn fix(reg: &dyn Registry, issues: &[crate::repair::Issue]) -> (Result<String, String>, Option<PathBuf>) {
+    use crate::repair;
+    let ops = repair::backup_ops(reg, issues);
+    let targets: Vec<String> = issues.iter().map(|i| i.target.clone()).collect();
+    let summary = format!("Repair {}", join_targets(&targets));
+    let path = match backup::save(&backup::dir(), &shell::file_stamp(), &shell::timestamp(), &summary, &ops) {
+        Ok(p) => p,
+        Err(e) => return (Err(format!("Could not save a backup, so nothing was repaired: {e}")), None),
+    };
+    let machine = match repair::fix_user(reg, issues) {
+        Ok(m) => m,
+        Err(e) => return (Err(format!("Repair stopped: {e}. Undo restores the previous state.")), Some(path)),
+    };
+    crate::shell_notify();
+    let elevated = crate::elevated::fix_machine(&machine);
+    crate::shell_notify();
+    let broken: Vec<String> = issues
+        .iter()
+        .filter_map(|i| repair::known(&i.target).filter(|_| i.fix() == repair::FixKind::RestoreKnown))
+        .filter(|k| !repair::verify_known(reg, *k))
+        .map(|k| k.ext.to_owned())
+        .collect();
+    logfile::write(&format!("REPAIR {targets:?}: elevated={elevated:?} still_broken={broken:?}"));
+    match elevated {
+        Err(e) => (Err(format!("Per-user fixes are done, but the system-wide part wasn't: {e}")), Some(path)),
+        Ok(()) if !broken.is_empty() => (Err(format!("{} still doesn't open correctly. Run \"sfc /scannow\" as admin.", join_targets(&broken))), Some(path)),
+        Ok(()) => (Ok(format!("Repaired {}.", join_targets(&targets))), Some(path)),
+    }
 }

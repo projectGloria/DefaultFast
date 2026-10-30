@@ -15,6 +15,7 @@ mod logfile;
 mod model;
 mod probe;
 mod registry;
+mod repair;
 mod repair_ui;
 mod search;
 mod selftest;
@@ -31,7 +32,10 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--diagnose") => diagnose(),
         Some("--self-test") => std::process::exit(selftest::run()),
+        Some("--elevated-fix" | "--elevated-set") => std::process::exit(elevated::main(&args)),
         Some("--startup-probe") => run_ui(true, None),
+        // Opens straight into the health check (handy as a "Repair file associations" shortcut).
+        Some("--repair") => run_ui(false, Some("--repair".into())),
         // `DefaultFast.exe .pdf` opens with the search pre-filled.
         Some(q) if !q.starts_with("--") => run_ui(false, Some(args.join(" "))),
         _ => run_ui(false, None),
@@ -90,6 +94,10 @@ fn diagnose() {
     for t in [".txt", ".pdf", ".html", ".mp4", "http", "https", "mailto"] {
         report.push_str(&format!("  {t}: legacy={:?} latest={} effective={:?}
 ", userchoice::validate(&reg, t, &sid), userchoice::uses_latest(&reg, t), shell::assoc_query(t, shell::AssocStr::ProgId)));
+    }
+    for i in repair::scan(&reg, &sid, &|p| std::path::Path::new(p).exists(), &shell::expand_env) {
+        report.push_str(&format!("  issue {}: {} (admin: {})
+", i.target, i.title(), repair::needs_machine(&reg, &i).is_some()));
     }
     for p in &index.programs {
         report.push_str(&format!("{} | {} | {} | {} targets\n", p.name, p.exe, p.aumid, p.supports.len()));

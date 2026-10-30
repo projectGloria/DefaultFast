@@ -110,8 +110,6 @@ pub enum AssocStr {
     ProgId,
     Executable,
     FriendlyApp,
-    FriendlyDoc,
-    Command,
 }
 
 /// What Shell *effectively* uses for an extension (".mp4") or protocol ("https"), after
@@ -122,8 +120,6 @@ pub fn assoc_query(target: &str, what: AssocStr) -> Option<String> {
         AssocStr::ProgId => ASSOCSTR_PROGID,
         AssocStr::Executable => ASSOCSTR_EXECUTABLE,
         AssocStr::FriendlyApp => ASSOCSTR_FRIENDLYAPPNAME,
-        AssocStr::FriendlyDoc => ASSOCSTR_FRIENDLYDOCNAME,
-        AssocStr::Command => ASSOCSTR_COMMAND,
     };
     let flags = if target.starts_with('.') { ASSOCF_NONE } else { ASSOCF_IS_PROTOCOL };
     let t = wide(target);

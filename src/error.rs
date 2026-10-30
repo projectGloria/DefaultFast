@@ -13,13 +13,6 @@ pub enum Error {
     },
     #[error("DefaultFast only changes file-association keys; refused to write {0}")]
     Forbidden(String),
-    /// Windows protects this setting (UCPD, UserChoiceLatest, unknown hash). The UI offers
-    /// the Settings fallback for this variant.
-    #[error("{0}")]
-    Protected(String),
-    /// The write succeeded but Shell reports a different effective handler.
-    #[error("Windows did not accept the change: {0}")]
-    NotHonored(String),
     #[error("{0}")]
     Invalid(String),
     #[error("The admin prompt was cancelled, so the system-wide setting was not changed")]
@@ -42,7 +35,7 @@ impl Error {
     }
     /// Whether the UI should offer "Open Settings" for this failure.
     pub fn wants_settings(&self) -> bool {
-        matches!(self, Error::Protected(_) | Error::NotHonored(_)) || self.is_access_denied()
+        self.is_access_denied()
     }
 }
 
