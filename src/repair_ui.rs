@@ -16,7 +16,6 @@ thread_local! {
     static HISTORY: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
     static ISSUE_MODEL: Rc<VecModel<IssueRow>> = Rc::new(VecModel::default());
     static HISTORY_MODEL: Rc<VecModel<HistoryRow>> = Rc::new(VecModel::default());
-    static SHOWING_HISTORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn run_health() {
@@ -85,7 +84,7 @@ pub fn history_loaded(entries: Vec<Entry>) {
 
 /// Refreshes the History list after a change, if it is on screen.
 pub fn history_changed() {
-    if SHOWING_HISTORY.with(|s| s.get()) {
+    if ui::main_app().is_some_and(|app| app.get_view() == 4) {
         ui::send(Job::Action(Action::ListHistory));
     }
 }
@@ -110,7 +109,6 @@ pub fn wire(app: &ui::AppWindow) {
     ISSUE_MODEL.with(|m| app.set_issues(ModelRc::from(m.clone())));
     HISTORY_MODEL.with(|m| app.set_history(ModelRc::from(m.clone())));
     app.on_show_repair(|| {
-        SHOWING_HISTORY.with(|s| s.set(false));
         ui::set_view_repair();
         run_health();
     });
@@ -122,7 +120,6 @@ pub fn wire(app: &ui::AppWindow) {
     });
     app.on_fix_all(|| fix(ISSUES.with(|s| s.borrow().clone())));
     app.on_show_history(|| {
-        SHOWING_HISTORY.with(|s| s.set(true));
         ui::set_view_history();
         ui::send(Job::Action(Action::ListHistory));
     });

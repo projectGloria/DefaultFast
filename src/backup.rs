@@ -35,23 +35,26 @@ impl Op {
 }
 
 /// Snapshot of a whole subtree (or its absence).
-pub fn snapshot_tree(reg: &dyn Registry, hive: Hive, path: &str) -> Vec<Op> {
+pub fn snapshot_tree(reg: &dyn Registry, hive: Hive, path: &str) -> Result<Vec<Op>> {
     let mut ops = vec![Op::DeleteTree(hive, path.to_owned())];
-    fn walk(reg: &dyn Registry, hive: Hive, path: &str, ops: &mut Vec<Op>, depth: u32) {
-        if depth > 12 || !reg.exists(hive, path) {
-            return;
+    fn walk(reg: &dyn Registry, hive: Hive, path: &str, ops: &mut Vec<Op>, depth: u32) -> Result<()> {
+        if depth > 128 { return Err(Error::Invalid(format!("Registry subtree too deep to back up: {path}"))); }
+        let Some(key) = reg.snapshot_key(hive, path)? else {
+            if depth != 0 { return Err(Error::Invalid("Registry changed while backing up".into())); }
+            return Ok(());
+        };
+        ops.push(Op::Key(hive, path.to_owned(), key.values));
+        for child in key.children {
+            walk(reg, hive, &format!("{path}\\{child}"), ops, depth + 1)?;
         }
-        ops.push(Op::Key(hive, path.to_owned(), reg.values(hive, path)));
-        for child in reg.subkeys(hive, path) {
-            walk(reg, hive, &format!("{path}\\{child}"), ops, depth + 1);
-        }
+        Ok(())
     }
-    walk(reg, hive, path, &mut ops, 0);
-    ops
+    walk(reg, hive, path, &mut ops, 0)?;
+    Ok(ops)
 }
 
-pub fn snapshot_value(reg: &dyn Registry, hive: Hive, path: &str, name: &str) -> Op {
-    Op::SetValue(hive, path.to_owned(), name.to_owned(), reg.get(hive, path, name))
+pub fn snapshot_value(reg: &dyn Registry, hive: Hive, path: &str, name: &str) -> Result<Op> {
+    Ok(Op::SetValue(hive, path.to_owned(), name.to_owned(), reg.snapshot_value(hive, path, name)?))
 }
 
 fn esc(s: &str) -> String {
@@ -150,7 +153,10 @@ fn parse_data(data: &str) -> Option<Option<Value>> {
     };
     let bytes: Vec<u8> = hexdata.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|b| u8::from_str_radix(b, 16)).collect::<std::result::Result<_, _>>().ok()?;
     Some(Some(match kind {
-        REG_SZ | REG_EXPAND_SZ | REG_DWORD => Value::from_bytes(kind, &bytes),
+        REG_SZ | REG_EXPAND_SZ | REG_DWORD => {
+            let value = Value::from_bytes(kind, &bytes);
+            if value.to_bytes() == bytes { value } else { Value::Raw(kind, bytes) }
+        },
         k => Value::Raw(k, bytes),
     }))
 }
@@ -168,8 +174,17 @@ pub fn parse_reg(text: &str) -> Result<(String, String, Vec<Op>)> {
     let mut pending = String::new();
     for raw in text.trim_start_matches('\u{feff}').lines() {
         let l = raw.trim_end_matches('\r');
-        if let Some(cont) = l.strip_suffix('\\').filter(|_| !l.trim_start().starts_with('[') && l.contains('=')) {
-            pending.push_str(cont.trim_start());
+        let can_continue = if pending.is_empty() {
+            !l.trim_start().starts_with(['[', ';']) && l.contains('=')
+        } else {
+            !l.trim_start().starts_with(';')
+        };
+        if let Some(cont) = l.strip_suffix('\\').filter(|_| can_continue) {
+            if pending.is_empty() {
+                pending.push_str(cont);
+            } else {
+                pending.push_str(cont.trim_start());
+            }
             continue;
         }
         if !pending.is_empty() {
@@ -178,6 +193,9 @@ pub fn parse_reg(text: &str) -> Result<(String, String, Vec<Op>)> {
         } else {
             lines.push(l.to_owned());
         }
+    }
+    if !pending.is_empty() {
+        lines.push(pending);
     }
     if lines.first().map(|l| l.trim()) != Some(HEADER) {
         return Err(bad("missing header"));
@@ -243,15 +261,43 @@ pub fn save(dir: &Path, stamp: &str, created: &str, summary: &str, ops: &[Op]) -
     Ok(path)
 }
 
-pub fn load(path: &Path) -> Result<(String, String, Vec<Op>)> {
+fn read_reg_text(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
-    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+    Ok(if bytes.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
-    };
-    parse_reg(&text)
+    })
+}
+
+pub fn load(path: &Path) -> Result<(String, String, Vec<Op>)> {
+    parse_reg(&read_reg_text(path)?)
+}
+
+/// Fast header-only scan for History: avoids parsing every hex/value line of all 50 backups.
+fn load_entry_meta(path: &Path) -> Option<(String, String, bool)> {
+    let text = read_reg_text(path).ok()?;
+    let mut lines = text.trim_start_matches('\u{feff}').lines().map(|l| l.trim());
+    if lines.next() != Some(HEADER) {
+        return None;
+    }
+    let (mut summary, mut created, mut machine) = (String::new(), String::new(), false);
+    for l in lines {
+        if let Some(c) = l.strip_prefix(';') {
+            let c = c.trim();
+            if let Some(s) = c.strip_prefix("Summary:") {
+                summary = s.trim().to_owned();
+            } else if let Some(s) = c.strip_prefix("Created:") {
+                created = s.trim().to_owned();
+            }
+        } else if let Some(k) = l.strip_prefix("[-").or_else(|| l.strip_prefix('[')).and_then(|k| k.strip_suffix(']')) {
+            if parse_key(k).is_some_and(|(h, _)| h == Hive::LocalMachine) {
+                machine = true;
+            }
+        }
+    }
+    Some((summary, created, machine))
 }
 
 #[derive(Clone, Debug)]
@@ -278,9 +324,8 @@ pub fn list(dir: &Path) -> Vec<Entry> {
     files
         .into_iter()
         .filter_map(|path| {
-            let (summary, created, ops) = load(&path).ok()?;
+            let (summary, created, machine) = load_entry_meta(&path)?;
             let undone = path.to_string_lossy().ends_with(".undone.reg");
-            let machine = ops.iter().any(|o| o.hive() == Hive::LocalMachine);
             Some(Entry { path, summary, created, undone, machine })
         })
         .collect()
@@ -314,17 +359,37 @@ pub fn mark_undone(path: &Path) -> PathBuf {
 }
 
 /// The subtree roots / values a backup covers, used to snapshot the *current* state before
-/// restoring (so a restore is itself undoable).
-pub fn coverage(reg: &dyn Registry, ops: &[Op]) -> Vec<Op> {
-    let mut out = Vec::new();
+/// restoring (so a restore is itself undoable). Deduplicates subtrees so child `Key` ops inside
+/// a `DeleteTree` root are not snapshotted a second time.
+pub fn coverage(reg: &dyn Registry, ops: &[Op]) -> Result<Vec<Op>> {
+    let mut roots: Vec<(Hive, String, String)> = Vec::new();
     for op in ops {
-        match op {
-            Op::DeleteTree(h, p) => out.extend(snapshot_tree(reg, *h, p)),
-            Op::SetValue(h, p, n, _) => out.push(snapshot_value(reg, *h, p, n)),
-            Op::Key(..) => {}
+        if let Op::DeleteTree(h, p) | Op::Key(h, p, _) = op {
+            let low = p.to_lowercase();
+            let covered = roots.iter().any(|(rh, _, rl)| *rh == *h && (low == *rl || low.strip_prefix(rl.as_str()).is_some_and(|r| r.starts_with('\\'))));
+            if !covered {
+                roots.retain(|(rh, _, rl)| !(*rh == *h && rl.strip_prefix(low.as_str()).is_some_and(|r| r.starts_with('\\'))));
+                roots.push((*h, p.clone(), low));
+            }
         }
     }
-    out
+    let mut out = Vec::new();
+    for (h, p, _) in &roots {
+        out.extend(snapshot_tree(reg, *h, p)?);
+    }
+    let mut seen_vals: Vec<(Hive, String, String)> = Vec::new();
+    for op in ops {
+        if let Op::SetValue(h, p, n, _) = op {
+            let low_p = p.to_lowercase();
+            let low_n = n.to_lowercase();
+            let in_root = roots.iter().any(|(rh, _, rl)| *rh == *h && (low_p == *rl || low_p.strip_prefix(rl.as_str()).is_some_and(|r| r.starts_with('\\'))));
+            if !in_root && !seen_vals.iter().any(|(sh, sp, sn)| *sh == *h && *sp == low_p && *sn == low_n) {
+                seen_vals.push((*h, low_p, low_n));
+                out.push(snapshot_value(reg, *h, p, n)?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Applies the HKCU part of a backup. HKLM `SetValue`s are returned for the elevated helper.
@@ -388,10 +453,41 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_fail_on_unreadable_keys_and_values() {
+        let r = seeded();
+        let root = fe(".mp4");
+        r.read_deny.lock().unwrap().push(format!("{}\\openwithlist", root.to_lowercase()));
+        assert!(snapshot_tree(&r, Hive::CurrentUser, &root).is_err());
+        r.read_deny.lock().unwrap().push("software\\classes\\.bat".into());
+        assert!(snapshot_value(&r, Hive::LocalMachine, "SOFTWARE\\Classes\\.bat", "").is_err());
+        assert!(coverage(&r, &[Op::DeleteTree(Hive::CurrentUser, root)]).is_err());
+    }
+
+    #[test]
+    fn snapshots_include_deep_children_or_fail_instead_of_truncating() {
+        let r = MemRegistry::new();
+        let root = "Software\\Classes\\Applications\\deep.exe";
+        let deep = format!("{root}{}", "\\child".repeat(20));
+        r.seed(Hive::CurrentUser, &deep, "data", Value::Dword(7));
+        let ops = snapshot_tree(&r, Hive::CurrentUser, root).unwrap();
+        r.delete_tree(Hive::CurrentUser, root).unwrap();
+        restore(&r, &ops, SID).unwrap();
+        assert_eq!(r.get(Hive::CurrentUser, &deep, "data"), Some(Value::Dword(7)));
+        r.seed_key(Hive::CurrentUser, &format!("{root}{}", "\\child".repeat(130)));
+        assert!(snapshot_tree(&r, Hive::CurrentUser, root).is_err());
+    }
+
+    #[test]
+    fn unusual_string_payloads_survive_backup_round_trip() {
+        let ops = vec![Op::SetValue(Hive::CurrentUser, "Software\\Classes\\.x".into(), String::new(), Some(Value::Raw(REG_SZ, vec![1, 2, 3])))];
+        assert_eq!(parse_reg(&to_reg("x", "now", &ops)).unwrap().2, ops);
+    }
+
+    #[test]
     fn reg_text_round_trip() {
         let r = seeded();
-        let mut ops = snapshot_tree(&r, Hive::CurrentUser, &fe(".mp4"));
-        ops.push(snapshot_value(&r, Hive::LocalMachine, "SOFTWARE\\Classes\\.bat", ""));
+        let mut ops = snapshot_tree(&r, Hive::CurrentUser, &fe(".mp4")).unwrap();
+        ops.push(snapshot_value(&r, Hive::LocalMachine, "SOFTWARE\\Classes\\.bat", "").unwrap());
         ops.push(Op::SetValue(Hive::LocalMachine, "SOFTWARE\\Classes\\.cmd".into(), String::new(), Some(Value::Sz("cmdfile".into()))));
         let text = to_reg("Set VLC as default for .mp4", "2026-10-30 20:00:00", &ops);
         assert!(text.starts_with(HEADER));
@@ -404,7 +500,7 @@ mod tests {
     #[test]
     fn restore_round_trip_regenerates_userchoice_hash() {
         let r = seeded();
-        let before = snapshot_tree(&r, Hive::CurrentUser, &fe(".mp4"));
+        let before = snapshot_tree(&r, Hive::CurrentUser, &fe(".mp4")).unwrap();
         let (_, _, ops) = parse_reg(&to_reg("x", "y", &before)).unwrap();
 
         // Change everything: new choice, extra key, removed list.
@@ -427,7 +523,7 @@ mod tests {
     #[test]
     fn restoring_a_missing_key_removes_it() {
         let r = MemRegistry::new();
-        let ops = snapshot_tree(&r, Hive::CurrentUser, "Software\\Classes\\Applications\\new.exe");
+        let ops = snapshot_tree(&r, Hive::CurrentUser, "Software\\Classes\\Applications\\new.exe").unwrap();
         assert_eq!(ops.len(), 1);
         r.set(Hive::CurrentUser, "Software\\Classes\\Applications\\new.exe\\shell\\open\\command", "", &Value::Sz("x".into())).unwrap();
         restore(&r, &ops, SID).unwrap();
@@ -456,5 +552,25 @@ mod tests {
         assert!(list(&d)[0].undone);
         assert_eq!(load(&undone).unwrap().2.len(), 1);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn multiline_continuation_values_parse() {
+        let text = concat!(
+            "Windows Registry Editor Version 5.00\r\n\r\n",
+            "; Summary: Multiline\r\n; Created: now\r\n\r\n",
+            "[HKEY_CURRENT_USER\\Software\\Classes\\.x]\r\n",
+            "\"Bin\"=hex:01,02,\\\r\n  03,04,\\\r\n  05,06\r\n",
+        );
+        let (_, _, ops) = parse_reg(text).unwrap();
+        assert_eq!(ops, vec![Op::Key(Hive::CurrentUser, "Software\\Classes\\.x".into(), vec![("Bin".into(), Value::Raw(REG_BINARY, vec![1, 2, 3, 4, 5, 6]))])]);
+    }
+
+    #[test]
+    fn coverage_does_not_duplicate_subtrees() {
+        let r = seeded();
+        let snap = snapshot_tree(&r, Hive::CurrentUser, &fe(".mp4")).unwrap();
+        let cov = coverage(&r, &snap).unwrap();
+        assert_eq!(cov, snap);
     }
 }

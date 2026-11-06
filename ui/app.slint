@@ -181,7 +181,7 @@ component ResultItem inherits Rectangle {
     accessible-label: data.title + (data.subtitle != "" ? ", " + data.subtitle : "");
     accessible-item-selectable: data.kind != 0;
     accessible-item-selected: root.selected;
-    accessible-action-default => { root.clicked(); }
+    accessible-action-default => { if (data.kind != 0) { root.clicked(); } }
     if data.kind == 0: Text {
         x: 14px;
         y: parent.height - self.height - 4px;
@@ -382,6 +382,7 @@ export component AppWindow inherits Window {
     in-out property <int> selected: -1;
     in property <length> selected-y;
     in property <length> selected-h;
+    in property <int> scroll-results;
     in property <string> results-message;
     in property <int> view: 0; // 0 welcome, 1 program, 2 file type/protocol, 3 repair, 4 history
     in property <bool> busy;
@@ -463,13 +464,16 @@ export component AppWindow inherits Window {
         search-input.select-all();
     }
     function ensure-visible() {
-        if (root.selected-y < -results-list.content-y) {
-            results-list.content-y = -root.selected-y;
-        } else if (root.selected-y + root.selected-h > -results-list.content-y + results-list.visible-height) {
-            results-list.content-y = -(root.selected-y + root.selected-h - results-list.visible-height);
+        if (root.selected >= 0) {
+            if (root.selected-y < -results-list.content-y) {
+                results-list.content-y = -root.selected-y;
+            } else if (root.selected-y + root.selected-h > -results-list.content-y + results-list.visible-height) {
+                results-list.content-y = -(root.selected-y + root.selected-h - results-list.visible-height);
+            }
         }
     }
     changed selected-y => { ensure-visible(); }
+    changed scroll-results => { ensure-visible(); }
 
     // Global shortcuts. capture-* runs before the focused widget sees the key.
     root-scope := FocusScope {
@@ -478,7 +482,7 @@ export component AppWindow inherits Window {
                 root.focus-search();
                 return accept;
             }
-            if (e.modifiers.control && e.text == Key.Return) {
+            if (!root.busy && !root.confirm-visible && !root.about-visible && e.modifiers.control && e.text == Key.Return) {
                 if (root.view == 1) { root.apply-selected(); }
                 if (root.view == 2) { root.set-handler(root.handler-selected); }
                 return accept;
@@ -705,21 +709,31 @@ export component AppWindow inherits Window {
                         }
                         support-scope := FocusScope {
                             property <int> req: root.detail-focus;
+                            property <int> sel: root.support-selected;
                             changed req => { self.focus(); }
+                            changed sel => {
+                                if (self.sel >= 0) {
+                                    if (self.sel * 40px < -supports-list.content-y) {
+                                        supports-list.content-y = -self.sel * 40px;
+                                    } else if ((self.sel + 1) * 40px > -supports-list.content-y + supports-list.visible-height) {
+                                        supports-list.content-y = -((self.sel + 1) * 40px - supports-list.visible-height);
+                                    }
+                                }
+                            }
                             vertical-stretch: 1;
                             accessible-role: list;
                             accessible-label: "File types and protocols";
                             key-pressed(e) => {
-                                if (e.text == Key.DownArrow) { root.support-selected = min(root.support-selected + 1, root.supports.length - 1); return accept; }
-                                if (e.text == Key.UpArrow) { root.support-selected = max(root.support-selected - 1, 0); return accept; }
-                                if (e.text == " ") { root.toggle-support(root.support-selected); return accept; }
+                                if (root.supports.length > 0 && e.text == Key.DownArrow) { root.support-selected = min(root.support-selected + 1, root.supports.length - 1); return accept; }
+                                if (root.supports.length > 0 && e.text == Key.UpArrow) { root.support-selected = max(root.support-selected - 1, 0); return accept; }
+                                if (root.supports.length > 0 && e.text == " ") { root.toggle-support(root.support-selected); return accept; }
                                 reject
                             }
                             Rectangle {
                                 border-radius: 4px;
                                 border-width: support-scope.has-focus ? 1px : 0px;
                                 border-color: Theme.accent;
-                                ListView {
+                                supports-list := ListView {
                                     for s[i] in root.supports: SupportItem {
                                         data: s;
                                         selected: i == root.support-selected && support-scope.has-focus;
@@ -785,21 +799,31 @@ export component AppWindow inherits Window {
                         Text { text: "Apps that can open it"; font-size: 13px; font-weight: 600; color: Theme.text-2; }
                         handler-scope := FocusScope {
                             property <int> req: root.detail-focus;
+                            property <int> sel: root.handler-selected;
                             changed req => { self.focus(); }
+                            changed sel => {
+                                if (self.sel >= 0) {
+                                    if (self.sel * 52px < -handlers-list.content-y) {
+                                        handlers-list.content-y = -self.sel * 52px;
+                                    } else if ((self.sel + 1) * 52px > -handlers-list.content-y + handlers-list.visible-height) {
+                                        handlers-list.content-y = -((self.sel + 1) * 52px - handlers-list.visible-height);
+                                    }
+                                }
+                            }
                             vertical-stretch: 1;
                             accessible-role: list;
                             accessible-label: "Apps that can open it";
                             key-pressed(e) => {
-                                if (e.text == Key.DownArrow) { root.handler-selected = min(root.handler-selected + 1, root.handlers.length - 1); return accept; }
-                                if (e.text == Key.UpArrow) { root.handler-selected = max(root.handler-selected - 1, 0); return accept; }
-                                if (e.text == Key.Return) { root.set-handler(root.handler-selected); return accept; }
+                                if (root.handlers.length > 0 && e.text == Key.DownArrow) { root.handler-selected = min(root.handler-selected + 1, root.handlers.length - 1); return accept; }
+                                if (root.handlers.length > 0 && e.text == Key.UpArrow) { root.handler-selected = max(root.handler-selected - 1, 0); return accept; }
+                                if (root.handlers.length > 0 && !root.busy && !root.confirm-visible && e.text == Key.Return) { root.set-handler(root.handler-selected); return accept; }
                                 reject
                             }
                             Rectangle {
                                 border-radius: 4px;
                                 border-width: handler-scope.has-focus ? 1px : 0px;
                                 border-color: Theme.accent;
-                                ListView {
+                                handlers-list := ListView {
                                     for h[i] in root.handlers: HandlerItem {
                                         data: h;
                                         selected: i == root.handler-selected && handler-scope.has-focus;

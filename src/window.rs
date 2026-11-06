@@ -52,6 +52,7 @@ thread_local! {
     static TITLE: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
     static SINK: RefCell<Option<Box<dyn Fn(ChromeEvent)>>> = const { RefCell::new(None) };
     static MAX_HOVER: Cell<bool> = const { Cell::new(false) };
+    static MAX_DOWN: Cell<bool> = const { Cell::new(false) };
     static ZOOMED: Cell<bool> = const { Cell::new(false) };
     static DARK: Cell<bool> = const { Cell::new(false) };
 }
@@ -217,14 +218,20 @@ unsafe extern "system" fn subclass_proc(h: HWND, msg: u32, wparam: WPARAM, lpara
             }
         }
         WM_NCMOUSELEAVE | WM_MOUSEMOVE => {
+            MAX_DOWN.with(|c| c.set(false));
             if MAX_HOVER.with(|c| c.replace(false)) {
                 emit(ChromeEvent::MaxHover(false));
             }
         }
         // Swallow presses on HTMAXBUTTON: DefWindowProc would paint a Windows 7 style button.
-        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if wparam.0 as u32 == HTMAXBUTTON => return LRESULT(0),
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if wparam.0 as u32 == HTMAXBUTTON => {
+            MAX_DOWN.with(|c| c.set(true));
+            return LRESULT(0);
+        }
         WM_NCLBUTTONUP if wparam.0 as u32 == HTMAXBUTTON => {
-            toggle_maximize();
+            if MAX_DOWN.with(|c| c.replace(false)) {
+                toggle_maximize();
+            }
             return LRESULT(0);
         }
         // Alt+Space: show the system menu even if the UI layer swallows SYSCHAR.

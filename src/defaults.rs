@@ -107,16 +107,24 @@ pub fn apply(reg: &dyn Registry, verify: Verify, sid: &str, req: &Request, stamp
 
     // Backup everything we may touch, before the first write.
     let reg_ops: Vec<_> = todo.iter().flat_map(|(t, p)| registration(reg, &req.exe, t, p)).collect();
-    let mut snap: Vec<Op> = Vec::new();
-    for (t, _) in &todo {
-        snap.extend(backup::snapshot_tree(reg, HKCU, &userchoice::choice_key(t)));
-    }
-    let mut roots: Vec<String> = reg_ops.iter().map(|(_, k, _, _)| registration_root(k)).collect();
-    roots.sort();
-    roots.dedup();
-    for r in &roots {
-        snap.extend(backup::snapshot_tree(reg, HKCU, r));
-    }
+    let snapshot = (|| -> crate::error::Result<Vec<Op>> {
+        let mut snap = Vec::new();
+        for (t, _) in &todo {
+            snap.extend(backup::snapshot_tree(reg, HKCU, &userchoice::choice_key(t))?);
+        }
+        let mut roots: Vec<String> = reg_ops.iter().map(|(_, k, _, _)| registration_root(k)).collect();
+        roots.sort();
+        roots.dedup();
+        for r in &roots { snap.extend(backup::snapshot_tree(reg, HKCU, r)?); }
+        Ok(snap)
+    })();
+    let snap = match snapshot {
+        Ok(snap) => snap,
+        Err(e) => {
+            results.extend(todo.iter().map(|(t, _)| (t.clone(), Status::Failed(format!("Could not back up settings, so nothing was changed: {e}")))));
+            return Report { results, backup: None };
+        }
+    };
     let targets: Vec<&str> = todo.iter().map(|t| t.0.as_str()).collect();
     let summary = format!("Set {} as default for {}", req.app_name, targets.join(", "));
     let backup_path = match backup::save(dir, stamp, created, &summary, &snap) {
@@ -132,19 +140,23 @@ pub fn apply(reg: &dyn Registry, verify: Verify, sid: &str, req: &Request, stamp
     for (hive, key, name, value) in &reg_ops {
         if let Err(e) = reg.set(*hive, key, name, value) {
             // Registration failed: undo it and stop; no UserChoice was written yet.
-            let _ = backup::restore(reg, &snap, sid);
-            let _ = std::fs::remove_file(&backup_path);
+            let rollback = backup::restore(reg, &snap, sid);
+            crate::shell_notify();
+            let recovery = match &rollback {
+                Ok(_) => { let _ = std::fs::remove_file(&backup_path); String::new() }
+                Err(e) => format!(" Rollback failed: {e}. Recovery backup kept at {}.", backup_path.display()),
+            };
             for (t, _) in &todo {
-                results.push((t.clone(), Status::Failed(format!("Could not register {}: {e}", req.app_name))));
+                results.push((t.clone(), Status::Failed(format!("Could not register {}: {e}.{recovery}", req.app_name))));
             }
-            return Report { results, backup: None };
+            return Report { results, backup: rollback.err().map(|_| backup_path) };
         }
     }
 
+    let mut rollback_failed = false;
     for (target, prog_id) in &todo {
         let r = userchoice::write(reg, target, prog_id, sid);
-        crate::shell_notify();
-        let status = match r {
+        let mut status = match r {
             Ok(()) if verify(target, prog_id, &req.exe) => Status::Done,
             Ok(()) => Status::Protected(format!("Windows kept its previous choice for {target}.")),
             Err(e) if e.wants_settings() => Status::Protected(format!("Windows blocked the change for {target}.")),
@@ -154,18 +166,34 @@ pub fn apply(reg: &dyn Registry, verify: Verify, sid: &str, req: &Request, stamp
             // Put this target's UserChoice back exactly as it was.
             let key = userchoice::choice_key(target);
             let mine: Vec<Op> = snap.iter().filter(|op| op_path(op).eq_ignore_ascii_case(&key)).cloned().collect();
-            let _ = backup::restore(reg, &mine, sid);
+            // A denied initial delete can leave the choice untouched; no rollback is needed.
+            let unchanged = backup::snapshot_tree(reg, HKCU, &key).is_ok_and(|current| current == mine);
+            if let Err(e) = if unchanged { Ok(Vec::new()) } else { backup::restore(reg, &mine, sid) } {
+                rollback_failed = true;
+                status = Status::Failed(format!("Could not restore {target}: {e}. Recovery backup kept at {}.", backup_path.display()));
+            }
         }
         results.push((target.clone(), status));
     }
     crate::shell_notify();
 
     let any_done = results.iter().any(|r| r.1 == Status::Done);
-    if !any_done {
+    if !any_done && !rollback_failed {
         // Nothing stuck: remove the registration too and drop the now-pointless backup.
-        let _ = backup::restore(reg, &snap, sid);
-        let _ = std::fs::remove_file(&backup_path);
-        return Report { results, backup: None };
+        let rollback = if reg_ops.is_empty() { Ok(Vec::new()) } else { backup::restore(reg, &snap, sid) };
+        match rollback {
+            Ok(_) => {
+                crate::shell_notify();
+                let _ = std::fs::remove_file(&backup_path);
+                return Report { results, backup: None };
+            }
+            Err(e) => {
+                for (_, status) in &mut results {
+                    *status = Status::Failed(format!("Rollback failed: {e}. Recovery backup kept at {}.", backup_path.display()));
+                }
+                crate::shell_notify();
+            }
+        }
     }
     Report { results, backup: Some(backup_path) }
 }
@@ -218,6 +246,63 @@ mod tests {
     /// Verifier backed by the mock: "effective" = UserChoice ProgId when its hash validates.
     fn verifier(r: &MemRegistry) -> impl Fn(&str, &str, &str) -> bool + '_ {
         move |t: &str, p: &str, _: &str| userchoice::validate(r, t, SID) == Some(true) && userchoice::read(r, t).is_some_and(|c| c.prog_id == p)
+    }
+
+    fn request() -> Request {
+        Request { app_name: "Test".into(), exe: "C:\\test.exe".into(), changes: vec![(".test".into(), "Applications\\test.exe".into())] }
+    }
+
+    #[test]
+    fn unreadable_snapshot_prevents_all_writes() {
+        let r = MemRegistry::new();
+        let key = userchoice::choice_key(".test");
+        r.read_deny.lock().unwrap().push(key.to_lowercase());
+        let d = tmp();
+        let rep = apply(&r, &|_, _, _| true, SID, &request(), "unreadable", "now", &d);
+        assert!(matches!(&rep.results[0].1, Status::Failed(e) if e.contains("nothing was changed")));
+        assert!(!r.exists(HKCU, &key));
+        assert!(!r.exists(HKCU, "Software\\Classes\\Applications\\test.exe"));
+        assert!(rep.backup.is_none());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn failed_target_rollback_keeps_recoverable_backup() {
+        let r = MemRegistry::new();
+        userchoice::write(&r, ".test", "Old.Handler", SID).unwrap();
+        let d = tmp();
+        let verify = |_: &str, _: &str, _: &str| {
+            r.deny.lock().unwrap().push(userchoice::choice_key(".test").to_lowercase());
+            false
+        };
+        let rep = apply(&r, &verify, SID, &request(), "rollback", "now", &d);
+        assert!(matches!(&rep.results[0].1, Status::Failed(e) if e.contains("Recovery backup kept")));
+        let path = rep.backup.unwrap();
+        assert!(path.exists());
+        r.deny.lock().unwrap().clear();
+        let ops = backup::load(&path).unwrap().2;
+        backup::restore(&r, &ops, SID).unwrap();
+        assert_eq!(userchoice::read(&r, ".test").unwrap().prog_id, "Old.Handler");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn failed_registration_and_full_rollback_keep_backups() {
+        for registration_fails in [true, false] {
+            let r = MemRegistry::new();
+            let key = "software\\classes\\applications\\test.exe";
+            if registration_fails { r.deny.lock().unwrap().push("software\\classes\\.test\\openwithprogids".into()); }
+            let verify = |_: &str, _: &str, _: &str| {
+                r.deny.lock().unwrap().push(key.into());
+                false
+            };
+            let d = tmp();
+            let rep = apply(&r, &verify, SID, &request(), "registration", "now", &d);
+            assert!(matches!(&rep.results[0].1, Status::Failed(e) if e.contains("Rollback failed")), "{:?}", rep.results);
+            assert!(rep.backup.unwrap().exists());
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

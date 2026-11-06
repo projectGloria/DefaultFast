@@ -76,7 +76,11 @@ pub fn fix_machine(items: &[KnownGood]) -> Result<()> {
 }
 
 /// Restores HKLM class defaults captured in a backup (Undo of a repair).
-pub fn restore_machine(ops: &[Op]) -> Result<()> {
+pub fn validate_restore(ops: &[Op]) -> Result<()> {
+    restore_pairs(ops).map(|_| ())
+}
+
+fn restore_pairs(ops: &[Op]) -> Result<Vec<String>> {
     let mut pairs = Vec::new();
     for op in ops {
         let Op::SetValue(Hive::LocalMachine, path, name, value) = op else {
@@ -86,12 +90,17 @@ pub fn restore_machine(ops: &[Op]) -> Result<()> {
         if !name.is_empty() || repair::known(ext).is_none() || !path.eq_ignore_ascii_case(&format!("SOFTWARE\\Classes\\{ext}")) {
             return Err(Error::Forbidden(path.clone()));
         }
-        pairs.push(match value.as_ref().and_then(Value::as_str) {
-            Some(v) if plain_prog_id(v) => format!("{ext}={v}"),
-            Some(_) => return Err(Error::Invalid(format!("Unexpected value in backup for {ext}"))),
+        pairs.push(match value {
+            Some(Value::Sz(v)) if plain_prog_id(v) => format!("{ext}={v}"),
             None => format!("{ext}=-"),
+            Some(_) => return Err(Error::Invalid(format!("Cannot restore the original value type or data for {ext}; no settings were restored"))),
         });
     }
+    Ok(pairs)
+}
+
+pub fn restore_machine(ops: &[Op]) -> Result<()> {
+    let pairs = restore_pairs(ops)?;
     if pairs.is_empty() {
         return Ok(());
     }
@@ -102,4 +111,28 @@ pub fn restore_machine(ops: &[Op]) -> Result<()> {
         };
     }
     run(format!("--elevated-set {}", pairs.join(" ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(value: Option<Value>) -> Op {
+        Op::SetValue(Hive::LocalMachine, "SOFTWARE\\Classes\\.bat".into(), String::new(), value)
+    }
+
+    #[test]
+    fn unsupported_machine_values_are_not_treated_as_absent() {
+        for value in [Value::Dword(42), Value::Raw(3, vec![1, 2]), Value::ExpandSz("batfile".into()), Value::Sz(String::new())] {
+            assert!(validate_restore(&[op(Some(value))]).is_err());
+        }
+        assert_eq!(restore_pairs(&[op(None)]).unwrap(), [".bat=-"]);
+        assert_eq!(restore_pairs(&[op(Some(Value::Sz("batfile".into())))]).unwrap(), [".bat=batfile"]);
+    }
+
+    #[test]
+    fn machine_restore_validates_every_operation_before_running() {
+        assert!(restore_pairs(&[op(Some(Value::Sz("batfile".into()))), op(Some(Value::Dword(1)))]).is_err());
+        assert!(validate_restore(&[Op::DeleteTree(Hive::LocalMachine, "SOFTWARE\\Classes\\.bat".into())]).is_err());
+    }
 }

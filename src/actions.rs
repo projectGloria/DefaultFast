@@ -9,7 +9,7 @@ use crate::{
     ui,
     worker::Job,
 };
-use std::{cell::RefCell, path::PathBuf};
+use std::{cell::{Cell, RefCell}, path::PathBuf};
 
 pub enum Action {
     Health,
@@ -28,6 +28,7 @@ pub enum Outcome {
 }
 
 thread_local! {
+    static MUTATING: Cell<bool> = const { Cell::new(false) };
     /// Backup created by the most recent change: what the toast's Undo restores.
     static LAST_BACKUP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static LAST_SETTINGS: RefCell<String> = const { RefCell::new(String::new()) };
@@ -78,8 +79,10 @@ pub fn run(reg: &dyn Registry, action: Action) -> Outcome {
 /// Restores a backup after snapshotting the current state (so the restore is undoable too).
 fn restore(reg: &dyn Registry, path: &std::path::Path, undo: bool) -> Result<String, String> {
     let (summary, _, ops) = backup::load(path).map_err(|e| e.to_string())?;
+    let machine: Vec<_> = ops.iter().filter(|op| matches!(op, backup::Op::SetValue(crate::registry::Hive::LocalMachine, ..) | backup::Op::Key(crate::registry::Hive::LocalMachine, ..) | backup::Op::DeleteTree(crate::registry::Hive::LocalMachine, ..))).cloned().collect();
+    crate::elevated::validate_restore(&machine).map_err(|e| e.to_string())?;
     let sid = shell::user_sid().map_err(|e| e.to_string())?;
-    let current = backup::coverage(reg, &ops);
+    let current = backup::coverage(reg, &ops).map_err(|e| format!("Could not back up the current state, so nothing was restored: {e}"))?;
     backup::save(&backup::dir(), &shell::file_stamp(), &shell::timestamp(), &format!("Before restoring: {summary}"), &current).map_err(|e| format!("Could not back up the current state, so nothing was restored: {e}"))?;
     let machine = backup::restore(reg, &ops, &sid).map_err(|e| e.to_string())?;
     crate::shell_notify();
@@ -109,8 +112,9 @@ fn join_targets(t: &[String]) -> String {
 
 pub fn on_reply(reply: crate::worker::Reply) {
     let crate::worker::Reply::Action(outcome) = reply else { return };
-    if let Some(app) = ui::main_app() {
-        app.set_busy(false);
+    if matches!(&outcome, Outcome::Applied { .. } | Outcome::Fixed { .. } | Outcome::Restored(_)) {
+        MUTATING.with(|busy| busy.set(false));
+        if let Some(app) = ui::main_app() { app.set_busy(false); }
     }
     match outcome {
         Outcome::Health(issues) => crate::repair_ui::health_done(issues),
@@ -157,13 +161,25 @@ pub fn on_reply(reply: crate::worker::Reply) {
                 Err(e) => ui::toast(&format!("Restore stopped: {e}"), 1, false, false),
             }
             LAST_BACKUP.with(|b| *b.borrow_mut() = None);
+            crate::repair_ui::run_health();
             ui::refresh_detail();
             crate::repair_ui::history_changed();
         }
     }
 }
 
+fn blocked() -> bool {
+    MUTATING.with(Cell::get) || PENDING.with(|p| p.borrow().is_some())
+}
+
+fn begin_mutation() -> bool {
+    if blocked() { return false; }
+    MUTATING.with(|busy| busy.set(true));
+    true
+}
+
 pub(crate) fn submit(action: Action, status: &str) {
+    if !begin_mutation() { return; }
     if let Some(app) = ui::main_app() {
         app.set_busy(true);
         app.set_status_text(status.into());
@@ -173,6 +189,7 @@ pub(crate) fn submit(action: Action, status: &str) {
 
 /// Asks first when a change makes double-click stop *running* scripts/installers.
 fn apply_with_confirm(req: Request, settings_uri: String) {
+    if blocked() { return; }
     let scripts: Vec<String> = req.changes.iter().map(|c| c.0.clone()).filter(|t| defaults::SCRIPT_TYPES.contains(&t.as_str())).collect();
     let name = req.app_name.clone();
     let action = Action::Apply { req, settings_uri };
@@ -190,6 +207,7 @@ fn apply_with_confirm(req: Request, settings_uri: String) {
 }
 
 pub(crate) fn confirm(action: Action, title: &str, text: &str, ok: &str, shield: bool) {
+    if blocked() { return; }
     PENDING.with(|p| *p.borrow_mut() = Some(action));
     if let Some(app) = ui::main_app() {
         app.set_confirm_title(title.into());
@@ -235,16 +253,18 @@ fn set_handler(i: i32) {
 fn browse() {
     let Some((target, _)) = ui::current_target() else { return };
     let owner = crate::window::hwnd();
-    // The file dialog runs its own modal loop: give it its own STA thread.
+    // The file dialog and PE version lookup run on a dedicated STA thread off the UI thread.
     std::thread::spawn(move || {
         let Some(exe) = shell::browse_exe(owner) else { return };
-        let _ = slint::invoke_from_event_loop(move || {
-            if exe.starts_with("\\\\") {
+        if exe.starts_with("\\\\") {
+            let _ = slint::invoke_from_event_loop(|| {
                 ui::toast("Programs on network shares can't be registered. Copy it to this PC first.", 1, false, false);
-                return;
-            }
-            let (desc, _) = shell::version_info(&exe);
-            let name = if desc.is_empty() { std::path::Path::new(&exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() } else { desc };
+            });
+            return;
+        }
+        let (desc, _) = shell::version_info(&exe);
+        let name = if desc.is_empty() { std::path::Path::new(&exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() } else { desc };
+        let _ = slint::invoke_from_event_loop(move || {
             let req = Request { app_name: name, exe: exe.clone(), changes: vec![(target, defaults::applications_prog_id(&exe))] };
             apply_with_confirm(req, settings_uri(None));
         });
@@ -260,6 +280,7 @@ pub fn wire(app: &ui::AppWindow) {
         let _ = shell::open_uri("ms-settings:defaultapps");
     });
     app.on_toast_undo_clicked(|| {
+        if blocked() { return; }
         if let Some(path) = LAST_BACKUP.with(|b| b.borrow_mut().take()) {
             if let Some(app) = ui::main_app() {
                 app.set_toast_visible(false);
@@ -295,7 +316,10 @@ pub fn wire(app: &ui::AppWindow) {
 /// Backup, per-user fixes, then one UAC prompt for any HKLM defaults, then verification.
 fn fix(reg: &dyn Registry, issues: &[crate::repair::Issue]) -> (Result<String, String>, Option<PathBuf>) {
     use crate::repair;
-    let ops = repair::backup_ops(reg, issues);
+    let ops = match repair::backup_ops(reg, issues) {
+        Ok(ops) => ops,
+        Err(e) => return (Err(format!("Could not back up settings, so nothing was repaired: {e}")), None),
+    };
     let targets: Vec<String> = issues.iter().map(|i| i.target.clone()).collect();
     let summary = format!("Repair {}", join_targets(&targets));
     let path = match backup::save(&backup::dir(), &shell::file_stamp(), &shell::timestamp(), &summary, &ops) {
@@ -320,5 +344,59 @@ fn fix(reg: &dyn Registry, issues: &[crate::repair::Issue]) -> (Result<String, S
         Err(e) => (Err(format!("Per-user fixes are done, but the system-wide part wasn't: {e}")), Some(path)),
         Ok(()) if !broken.is_empty() => (Err(format!("{} still doesn't open correctly. Run \"sfc /scannow\" as admin.", join_targets(&broken))), Some(path)),
         Ok(()) => (Ok(format!("Repaired {}.", join_targets(&targets))), Some(path)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_machine_restore_stops_before_per_user_changes() {
+        use crate::registry::{Hive, MemRegistry, Value};
+        let r = MemRegistry::new();
+        let key = "Software\\Classes\\.restoretest";
+        r.seed(Hive::CurrentUser, key, "", Value::Sz("keep".into()));
+        let d = std::env::temp_dir().join(format!("df-restore-preflight-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = backup::save(&d, "unsupported", "now", "test", &[
+            backup::Op::DeleteTree(Hive::CurrentUser, key.into()),
+            backup::Op::SetValue(Hive::LocalMachine, "SOFTWARE\\Classes\\.bat".into(), String::new(), Some(Value::Dword(9))),
+        ]).unwrap();
+        assert!(restore(&r, &path, true).unwrap_err().contains("original value type"));
+        assert_eq!(r.string(Hive::CurrentUser, key, "").as_deref(), Some("keep"));
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn unreadable_repair_snapshot_stops_before_mutation() {
+        use crate::{registry::{Hive, MemRegistry, Value}, repair::{Issue, Kind}};
+        let r = MemRegistry::new();
+        let key = "Software\\Classes\\.bat";
+        r.seed(Hive::CurrentUser, key, "", Value::Sz("broken".into()));
+        r.read_deny.lock().unwrap().push(key.to_lowercase());
+        let (result, backup) = fix(&r, &[Issue { target: ".bat".into(), kind: Kind::NoHandler }]);
+        assert!(result.unwrap_err().contains("nothing was repaired"));
+        assert!(backup.is_none());
+        assert_eq!(r.string(Hive::CurrentUser, key, "").as_deref(), Some("broken"));
+    }
+
+    #[test]
+    fn mutation_gate_rejects_repeats_and_ignores_background_replies() {
+        MUTATING.with(|b| b.set(false));
+        PENDING.with(|p| *p.borrow_mut() = None);
+        assert!(begin_mutation());
+        assert!(!begin_mutation());
+        on_reply(crate::worker::Reply::Action(Outcome::History(Vec::new())));
+        assert!(!begin_mutation());
+        on_reply(crate::worker::Reply::Action(Outcome::Health(Vec::new())));
+        assert!(!begin_mutation());
+        on_reply(crate::worker::Reply::Action(Outcome::Restored(Err("partial restore".into()))));
+        assert!(begin_mutation());
+        MUTATING.with(|b| b.set(false));
+        PENDING.with(|p| *p.borrow_mut() = Some(Action::Fix(Vec::new())));
+        assert!(!begin_mutation());
+        PENDING.with(|p| *p.borrow_mut() = None);
     }
 }

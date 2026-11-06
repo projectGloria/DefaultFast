@@ -66,3 +66,16 @@ reg add HKLM\SOFTWARE\Classes\.cmd /ve /d "" /f
   `Ctrl+Enter`, `Esc`, `Tab`.
 - With Narrator: the search box, result items ("…, PDF file"), buttons, check rows ("…, currently
   …") and toasts are announced; icon glyphs are silent.
+
+## Recovery and operation serialization regressions
+- While a change or UAC helper is running, repeat Ctrl+Enter and Enter in a handler list.
+  Expect one operation and one backup; health/history replies must not unlock write controls.
+- Open a script confirmation, then repeat Ctrl+Enter. The pending action must remain unchanged.
+- Repair a broken association, then Undo from History or the toast. Expect "Checking…", then
+  the original issue again. Repeat with Restore; a failed/partial restore must also recheck.
+- In a test VM, make a target's backup subtree unreadable. Apply/Repair/Restore must stop
+  before any mutation and explain that the current state could not be backed up.
+- In a test VM, deny a rollback write after applying. Expect an error with the retained
+  backup path and an Undo option; clearing the denial should allow restoration from History.
+- A backup containing a non-string HKLM default must be rejected before per-user restoration
+  or elevation. Verify the machine value and all per-user settings remain unchanged.

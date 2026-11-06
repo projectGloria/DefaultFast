@@ -15,8 +15,8 @@ pub fn score(text: &str, query: &str) -> i32 {
         return 90_000 - text.len().min(1000) as i32;
     }
     if let Some(pos) = text.find(query) {
-        // `pos > 0` here (prefix handled above), so the previous byte exists.
-        let boundary = !text.as_bytes()[pos - 1].is_ascii_alphanumeric();
+        // `pos > 0` here (prefix handled above), so a previous char exists.
+        let boundary = text[..pos].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
         return if boundary { 80_000 } else { 60_000 } - pos.min(1000) as i32 - text.len().min(1000) as i32 / 4;
     }
     // Subsequence ("ntpd" -> notepad): must start at a word start and stay compact (at most
@@ -106,6 +106,12 @@ pub fn run(index: &Index, query: &str, out: &mut Results) {
     if q.is_empty() {
         return;
     }
+    if q == "." {
+        for (i, _) in index.file_types.iter().enumerate().take(MAX_PER_GROUP) {
+            out.file_types.push((i, 90_000 - i as i32));
+        }
+        return;
+    }
     // A query that starts with "." is clearly about file types; skip program noise.
     let wants_ext = query.trim_start().starts_with('.');
     if !wants_ext {
@@ -163,6 +169,7 @@ mod tests {
         assert_eq!(score("pdf", "bat"), 0);
         assert_eq!(score("bxxxxxxxxxxxxaxxxxxxxxxt", "bat"), 0, "mostly gaps");
         assert!(score("türkçe 文件", "文件") > 0);
+        assert!(score("türkçe pdf", "pdf") > score("türkçepdf", "pdf"), "UTF-8 word boundary vs inner match");
         assert!(score("notepad++", "ntpd") > 0, "subsequence");
         assert!(score("vlc media player", "vlc") > score("video lan client", "vlc"));
     }
@@ -199,6 +206,9 @@ mod tests {
         run(&idx, ".pd", &mut r);
         assert!(r.programs.is_empty(), "dot queries are file-type only");
         assert_eq!(idx.file_types[r.file_types[0].0].ext, ".pdf");
+
+        run(&idx, ".", &mut r);
+        assert!(r.programs.is_empty() && !r.file_types.is_empty(), "bare dot lists file types");
 
         run(&idx, "notepad", &mut r);
         assert_eq!(idx.programs[r.programs[0].0].name, "Notepad++");

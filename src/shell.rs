@@ -81,13 +81,13 @@ pub fn expand_env(s: &str) -> String {
         return s.to_owned();
     }
     let input = wide(s);
-    let mut out = vec![0u16; 4096];
+    let mut out = [0u16; 4096];
     // SAFETY: `out` is a valid buffer; the return value is the required length incl. NUL.
     let n = unsafe { ExpandEnvironmentStringsW(PCWSTR(input.as_ptr()), Some(&mut out)) } as usize;
     if n == 0 || n > out.len() {
         return s.to_owned();
     }
-    from_wide(&out)
+    from_wide(&out[..n])
 }
 
 /// Resolves "@shell32.dll,-1234" / "@{Package?ms-resource://…}" strings; others pass through.
@@ -95,7 +95,7 @@ pub fn load_indirect(s: &str) -> String {
     if !s.starts_with('@') {
         return s.to_owned();
     }
-    let mut out = vec![0u16; 1024];
+    let mut out = [0u16; 1024];
     let input = wide(s);
     // SAFETY: valid in/out buffers; the reserved parameter is None.
     if unsafe { SHLoadIndirectString(PCWSTR(input.as_ptr()), &mut out, None) }.is_ok() {
@@ -123,7 +123,7 @@ pub fn assoc_query(target: &str, what: AssocStr) -> Option<String> {
     };
     let flags = if target.starts_with('.') { ASSOCF_NONE } else { ASSOCF_IS_PROTOCOL };
     let t = wide(target);
-    let mut buf = vec![0u16; 2048];
+    let mut buf = [0u16; 2048];
     let mut len = buf.len() as u32;
     // SAFETY: `buf` has `len` slots; extra/verb pointers are null.
     let r = unsafe {
@@ -137,6 +137,7 @@ pub fn assoc_query(target: &str, what: AssocStr) -> Option<String> {
 }
 
 /// Tells Explorer to reload associations and icons; no explorer.exe restart needed.
+#[cfg_attr(test, allow(dead_code))]
 pub fn notify_assoc_changed() {
     // SAFETY: SHCNE_ASSOCCHANGED takes no item pointers.
     unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) }
@@ -224,17 +225,31 @@ pub fn start_menu_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Resolves a .lnk to its target path without touching the network (SLGP_RAWPATH, no Resolve).
-pub fn resolve_shortcut(path: &std::path::Path) -> Option<String> {
-    // SAFETY: COM objects are reference counted by the bindings; buffers are local.
-    unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        let file: IPersistFile = link.cast().ok()?;
-        file.Load(&HSTRING::from(path.as_os_str()), STGM_READ).ok()?;
-        let mut buf = vec![0u16; 1024];
-        link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32).ok()?;
-        let s = expand_env(&from_wide(&buf));
-        (!s.is_empty()).then_some(s)
+/// Reuses one `IShellLinkW` + `IPersistFile` instance across the Start Menu scan.
+pub struct ShortcutResolver(Option<(IShellLinkW, IPersistFile)>);
+
+impl ShortcutResolver {
+    pub fn new() -> Self {
+        // SAFETY: in-proc COM object bound to the calling thread's apartment.
+        let pair = unsafe {
+            CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .ok()
+                .and_then(|link| link.cast::<IPersistFile>().ok().map(|file| (link, file)))
+        };
+        Self(pair)
+    }
+
+    /// Resolves a .lnk to its target path without touching the network (SLGP_RAWPATH, no Resolve).
+    pub fn resolve(&self, path: &std::path::Path) -> Option<String> {
+        let (link, file) = self.0.as_ref()?;
+        // SAFETY: COM calls on valid interfaces with a local stack buffer.
+        unsafe {
+            file.Load(&HSTRING::from(path.as_os_str()), STGM_READ).ok()?;
+            let mut buf = [0u16; 1024];
+            link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32).ok()?;
+            let s = expand_env(&from_wide(&buf));
+            (!s.is_empty()).then_some(s)
+        }
     }
 }
 

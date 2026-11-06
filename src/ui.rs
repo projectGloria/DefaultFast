@@ -15,7 +15,10 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -159,6 +162,13 @@ fn request_icon(src: IconSource) {
     ICONS.with(|c| {
         let mut c = c.borrow_mut();
         if c.requested.insert(src.clone()) {
+            c.order.push_back(src.clone());
+            while c.order.len() > ICON_CACHE_MAX {
+                if let Some(old) = c.order.pop_front() {
+                    c.images.remove(&old);
+                    c.requested.remove(&old);
+                }
+            }
             let px = c.px;
             if let Some(tx) = &c.tx {
                 let _ = tx.send((src, px));
@@ -173,14 +183,6 @@ fn icon_loaded(src: IconSource, w: u32, h: u32, px: Vec<u8>) {
     ICONS.with(|c| {
         let mut c = c.borrow_mut();
         c.images.insert(src.clone(), img.clone());
-        c.order.push_back(src.clone());
-        // Bounded cache: drop the oldest entries (rows keep their own Image clone).
-        while c.order.len() > ICON_CACHE_MAX {
-            if let Some(old) = c.order.pop_front() {
-                c.images.remove(&old);
-                c.requested.remove(&old);
-            }
-        }
     });
     MODELS.with(|m| {
         m.results.icon_arrived(&src, &img);
@@ -237,14 +239,21 @@ enum View {
 pub(crate) struct State {
     app: slint::Weak<AppWindow>,
     index: Arc<Index>,
+    custom_supports: HashMap<String, Vec<SupportState>>,
     results: search::Results,
     rows: Vec<RowRef>,
     view: View,
+    detail_seq: Arc<AtomicU64>,
     detail_icon: Option<IconSource>,
     last_index: Instant,
     scanning: bool,
     jobs: mpsc::Sender<Job>,
-    reg: Arc<WinRegistry>,
+}
+
+impl State {
+    fn next_seq(&self) -> u64 {
+        self.detail_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 fn with_state<R>(f: impl FnOnce(&mut State, &AppWindow) -> R) -> Option<R> {
@@ -266,22 +275,13 @@ fn os_build(reg: &dyn Registry) -> u32 {
         .unwrap_or(0)
 }
 
-fn system_dark(reg: &dyn Registry) -> bool {
-    matches!(reg.get(Hive::CurrentUser, "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "AppsUseLightTheme"), Some(crate::registry::Value::Dword(0)))
-}
-
 /// Accent colors as Windows 11 uses them: AccentPalette[4] (Dark1) on light backgrounds,
 /// AccentPalette[1] (Light2) on dark backgrounds.
-fn apply_accent(app: &AppWindow, reg: &dyn Registry) {
-    if let Some(crate::registry::Value::Raw(_, b)) =
-        reg.get(Hive::CurrentUser, "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent", "AccentPalette")
-    {
-        if b.len() >= 32 {
-            let c = |i: usize| slint::Color::from_rgb_u8(b[i * 4], b[i * 4 + 1], b[i * 4 + 2]);
-            let theme = app.global::<Theme>();
-            theme.set_accent_light(c(4).into());
-            theme.set_accent_dark(c(1).into());
-        }
+fn set_accent_colors(app: &AppWindow, accent: Option<([u8; 3], [u8; 3])>) {
+    if let Some((light, dark)) = accent {
+        let theme = app.global::<Theme>();
+        theme.set_accent_light(slint::Color::from_rgb_u8(light[0], light[1], light[2]).into());
+        theme.set_accent_dark(slint::Color::from_rgb_u8(dark[0], dark[1], dark[2]).into());
     }
 }
 
@@ -290,8 +290,8 @@ fn placement_path() -> std::path::PathBuf {
 }
 
 /// Restores the saved outer position + client size (physical px), compensating for the
-/// caption height winit adds and our WM_NCCALCSIZE removes.
-fn restore_placement(app: &AppWindow) {
+/// caption height winit adds and our WM_NCCALCSIZE removes. Returns the monitor DPI scale.
+fn restore_placement(app: &AppWindow) -> f32 {
     let saved = std::fs::read_to_string(placement_path()).unwrap_or_default();
     let v: Vec<i32> = saved.split_whitespace().filter_map(|x| x.parse().ok()).collect();
     if let [x, y, w, h, max] = v[..] {
@@ -302,43 +302,49 @@ fn restore_placement(app: &AppWindow) {
             if max != 0 {
                 app.window().set_maximized(true);
             }
-            return;
+            return window::scale_at(x, y);
         }
     }
     // First run: 760x560 logical client area, centered by Windows.
     let scale = window::scale_at(0, 0);
     let extra = window::top_extra_px(0, 0) as f32 / scale;
     app.window().set_size(slint::LogicalSize::new(760.0, 560.0 - extra));
+    scale
 }
 
 fn save_placement(app: &AppWindow) {
     let w = app.window();
     let max = w.is_maximized();
-    let old = std::fs::read_to_string(placement_path()).unwrap_or_default();
-    let line = if max {
-        // Keep the last normal rectangle; only flip the maximized flag.
-        let v: Vec<&str> = old.split_whitespace().collect();
-        if v.len() == 5 {
-            format!("{} {} {} {} 1", v[0], v[1], v[2], v[3])
+    let (p, s) = (w.position(), w.size());
+    std::thread::spawn(move || {
+        let path = placement_path();
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = if max {
+            // Keep the last normal rectangle; only flip the maximized flag.
+            let v: Vec<&str> = old.split_whitespace().collect();
+            if v.len() == 5 {
+                format!("{} {} {} {} 1", v[0], v[1], v[2], v[3])
+            } else {
+                let scale = window::scale_at(p.x, p.y);
+                let (nw, nh) = ((760.0 * scale) as i32, (560.0 * scale) as i32);
+                format!("{} {} {nw} {nh} 1", p.x.max(0), p.y.max(0))
+            }
         } else {
-            return;
-        }
-    } else {
-        let (p, s) = (w.position(), w.size());
-        format!("{} {} {} {} 0", p.x, p.y, s.width, s.height)
-    };
-    let _ = std::fs::write(placement_path(), line);
+            format!("{} {} {} {} 0", p.x, p.y, s.width, s.height)
+        };
+        let _ = std::fs::write(path, line);
+    });
 }
 
 pub fn run(probe: bool, query: Option<String>) -> Result<(), slint::PlatformError> {
     slint::BackendSelector::new().backend_name("winit".into()).renderer_name("software".into()).select()?;
     let app = AppWindow::new()?;
     let reg = Arc::new(WinRegistry);
-    let dark = system_dark(reg.as_ref());
+    let dark = worker::system_dark(reg.as_ref());
 
     app.set_version(env!("CARGO_PKG_VERSION").into());
     app.global::<Theme>().set_icon_font(if os_build(reg.as_ref()) >= 22000 { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }.into());
-    apply_accent(&app, reg.as_ref());
+    set_accent_colors(&app, worker::accent_colors(reg.as_ref()));
     app.set_results_message("Start typing. Try .pdf, vlc or https.".into());
     MODELS.with(|m| {
         app.set_results(ModelRc::from(m.results.clone()));
@@ -350,18 +356,18 @@ pub fn run(probe: bool, query: Option<String>) -> Result<(), slint::PlatformErro
     window::install("DefaultFast", dark, |e| {
         let _ = slint::invoke_from_event_loop(move || on_chrome(e));
     });
-    restore_placement(&app);
+    let scale = restore_placement(&app);
 
     // Threads: icons, worker (Shell queries + all registry writes, serialized).
     let (icon_tx, icon_rx) = mpsc::channel();
     icon_thread(icon_rx);
-    let scale = window::scale_at(0, 0);
     ICONS.with(|c| {
         let mut c = c.borrow_mut();
         c.tx = Some(icon_tx);
         c.px = if scale > 1.4 { 48 } else if scale > 1.1 { 32 } else { 24 };
     });
-    let jobs = worker::spawn(reg.clone(), |reply| {
+    let detail_seq = Arc::new(AtomicU64::new(0));
+    let jobs = worker::spawn(reg, detail_seq.clone(), |reply| {
         let _ = slint::invoke_from_event_loop(move || on_reply(reply));
     });
 
@@ -369,14 +375,15 @@ pub fn run(probe: bool, query: Option<String>) -> Result<(), slint::PlatformErro
         *s.borrow_mut() = Some(State {
             app: app.as_weak(),
             index: Arc::new(Index::default()),
+            custom_supports: HashMap::new(),
             results: search::Results::default(),
             rows: Vec::new(),
             view: View::Welcome,
+            detail_seq,
             detail_icon: None,
             last_index: Instant::now(),
             scanning: false,
             jobs,
-            reg,
         })
     });
 
@@ -432,8 +439,7 @@ fn on_chrome(e: ChromeEvent) {
         ChromeEvent::MaxHover(h) => app.set_max_hover(h),
         ChromeEvent::Maximized(m) => app.set_is_max(m),
         ChromeEvent::ThemeChanged => {
-            window::set_dark(system_dark(s.reg.as_ref()));
-            apply_accent(app, s.reg.as_ref());
+            let _ = s.jobs.send(Job::Theme);
         }
         ChromeEvent::SettingChanged => {
             s.last_index = Instant::now() - STALE_AFTER;
@@ -478,9 +484,16 @@ fn start_scan() {
         .expect("spawn scan thread");
 }
 
-fn on_index(index: Index) {
+fn on_index(mut index: Index) {
     let complete = index.complete;
     with_state(|s, app| {
+        for (key, extras) in &s.custom_supports {
+            if let Some(p) = index.programs.iter_mut().find(|p| p.key() == *key) {
+                for ex in extras {
+                    p.add_support(&ex.target, &ex.prog_id);
+                }
+            }
+        }
         s.index = Arc::new(index);
         if complete {
             s.scanning = false;
@@ -514,7 +527,7 @@ const HEADER_H: f32 = 30.0;
 const ITEM_H: f32 = 46.0;
 
 fn row_y(rows: &[RowRef], i: usize) -> f32 {
-    rows[..i].iter().map(|r| if *r == RowRef::Header { HEADER_H } else { ITEM_H }).sum()
+    rows.get(..i).unwrap_or(rows).iter().map(|r| if *r == RowRef::Header { HEADER_H } else { ITEM_H }).sum()
 }
 
 fn set_selected(s: &State, app: &AppWindow, i: i32) {
@@ -522,6 +535,7 @@ fn set_selected(s: &State, app: &AppWindow, i: i32) {
     if i >= 0 {
         app.set_selected_y(row_y(&s.rows, i as usize));
         app.set_selected_h(ITEM_H);
+        app.set_scroll_results(app.get_scroll_results().wrapping_add(1));
     }
 }
 
@@ -656,9 +670,10 @@ fn open_program(s: &mut State, app: &AppWindow, key: &str) {
         String::new()
     }.into());
     let targets: Vec<(String, String)> = supports.iter().map(|x| (x.target.clone(), x.prog_id.clone())).collect();
+    let seq = s.next_seq();
     s.view = View::Program { key: key.to_owned(), rows: supports.iter().map(|x| SupportState { target: x.target.clone(), prog_id: x.prog_id.clone() }).collect() };
     app.set_view(1);
-    let _ = s.jobs.send(Job::ProgramDefaults { key: key.to_owned(), targets, exe: p.exe.clone() });
+    let _ = s.jobs.send(Job::ProgramDefaults { seq, key: key.to_owned(), targets, exe: p.exe.clone() });
 }
 
 fn open_target(s: &mut State, app: &AppWindow, target: &str) {
@@ -680,9 +695,10 @@ fn open_target(s: &mut State, app: &AppWindow, target: &str) {
     app.set_can_browse(true);
     MODELS.with(|m| m.handlers.set(Vec::new()));
     app.set_handler_selected(0);
+    let seq = s.next_seq();
     s.view = View::Target { target: target.to_owned(), candidates: Vec::new() };
     app.set_view(2);
-    let _ = s.jobs.send(Job::TargetInfo { target: target.to_owned(), index: s.index.clone() });
+    let _ = s.jobs.send(Job::TargetInfo { seq, target: target.to_owned(), index: s.index.clone() });
 }
 
 fn on_reply(reply: Reply) {
@@ -727,6 +743,12 @@ fn on_reply(reply: Reply) {
                 let first = c.iter().position(|x| !x.is_current).unwrap_or(0);
                 app.set_handler_selected(first as i32);
             });
+        }
+        Reply::Theme { dark, accent } => {
+            window::set_dark(dark);
+            if let Some(app) = main_app() {
+                set_accent_colors(&app, accent);
+            }
         }
         other => crate::actions::on_reply(other),
     }
@@ -784,6 +806,7 @@ pub(crate) fn refresh_detail() {
 
 pub(crate) fn set_view_repair() {
     with_state(|s, app| {
+        s.next_seq();
         s.view = View::Repair;
         app.set_view(3);
     });
@@ -791,6 +814,7 @@ pub(crate) fn set_view_repair() {
 
 pub(crate) fn set_view_history() {
     with_state(|s, app| {
+        s.next_seq();
         s.view = View::History;
         app.set_view(4);
     });
@@ -882,17 +906,20 @@ fn wire_callbacks(app: &AppWindow) {
             } else if !app.get_query().is_empty() {
                 app.set_query("".into());
                 refresh_results(s, app, None);
+                s.next_seq();
                 s.view = View::Welcome;
                 app.set_view(0);
             } else {
+                s.next_seq();
                 s.view = View::Welcome;
                 app.set_view(0);
             }
         });
     });
     app.on_toggle_support(|i| {
+        let Ok(i) = usize::try_from(i) else { return };
         let Some(app) = main_app() else { return };
-        MODELS.with(|m| m.supports.update(i as usize, |r| r.checked = !r.checked));
+        MODELS.with(|m| m.supports.update(i, |r| r.checked = !r.checked));
         update_checked(&app);
     });
     app.on_select_all(|| {
@@ -920,26 +947,37 @@ fn wire_callbacks(app: &AppWindow) {
 
 fn add_target(text: &str) {
     // `toast` re-borrows STATE, so decide inside the borrow and toast after it.
-    let packaged = with_state(|s, app| {
-        let View::Program { key, rows } = &mut s.view else { return false };
-        let Some(p) = s.index.program_by_key(key) else { return false };
+    let msg = with_state(|s, app| -> Option<&'static str> {
+        let View::Program { key, rows } = &mut s.view else { return None };
+        let Some(p) = s.index.program_by_key(key).cloned() else { return None };
         let raw = text.trim().to_lowercase();
+        if raw.is_empty() {
+            return None;
+        }
         let target = if raw.starts_with('.') || !s.index.protocols.iter().any(|x| x.name == raw) {
             match discovery::normalize_extension(&raw) {
                 Some(t) => t,
-                None => return false,
+                None => return Some("Enter a valid file extension (for example .txt)."),
             }
         } else {
             raw
         };
         if p.exe.is_empty() {
-            return true;
+            return Some("Store apps can only open the file types they declare. Use Windows Settings for this app.");
         }
-        if rows.iter().any(|r| r.target == target) {
-            return false;
+        if let Some(i) = rows.iter().position(|r| r.target == target) {
+            MODELS.with(|m| m.supports.update(i, |r| r.checked = true));
+            app.set_support_selected(i as i32);
+            update_checked(app);
+            return None;
         }
         let prog_id = format!("Applications\\{}", p.exe_name());
-        rows.push(SupportState { target: target.clone(), prog_id: prog_id.clone() });
+        let state = SupportState { target: target.clone(), prog_id: prog_id.clone() };
+        rows.push(state.clone());
+        s.custom_supports.entry(key.clone()).or_default().push(state);
+        if let Some(prog) = Arc::make_mut(&mut s.index).programs.iter_mut().find(|x| x.key() == *key) {
+            prog.add_support(&target, &prog_id);
+        }
         let src = (!is_protocol(&target)).then(|| IconSource::Extension(target.clone()));
         MODELS.with(|m| {
             m.supports.push(SupportRow { target: target.as_str().into(), current: "…".into(), checked: true, ..Default::default() }, src);
@@ -947,11 +985,13 @@ fn add_target(text: &str) {
         });
         app.set_program_note("".into());
         update_checked(app);
-        let _ = s.jobs.send(Job::ProgramDefaults { key: key.clone(), targets: vec![(target, prog_id)], exe: p.exe.clone() });
-        false
-    });
-    if packaged == Some(true) {
-        toast("Store apps can only open the file types they declare. Use Windows Settings for this app.", 1, false, false);
+        let seq = s.detail_seq.load(Ordering::Relaxed);
+        let _ = s.jobs.send(Job::ProgramDefaults { seq, key: key.clone(), targets: vec![(target, prog_id)], exe: p.exe });
+        None
+    })
+    .flatten();
+    if let Some(m) = msg {
+        toast(m, 1, false, false);
     }
 }
 

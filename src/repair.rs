@@ -142,7 +142,7 @@ pub fn needs_machine(reg: &dyn Registry, issue: &Issue) -> Option<KnownGood> {
     }
     let k = known(&issue.target)?;
     let current = reg.string(HKLM, &format!("SOFTWARE\\Classes\\{}", k.ext), "");
-    (current.as_deref() != Some(k.prog_id)).then_some(k)
+    (!current.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(k.prog_id))).then_some(k)
 }
 
 /// Step 4: the class has something to run.
@@ -236,23 +236,23 @@ pub fn scan(reg: &dyn Registry, sid: &str, exe_exists: &dyn Fn(&str) -> bool, ex
 }
 
 /// Everything a set of fixes will touch, for the pre-write backup.
-pub fn backup_ops(reg: &dyn Registry, issues: &[Issue]) -> Vec<Op> {
+pub fn backup_ops(reg: &dyn Registry, issues: &[Issue]) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
     for i in issues {
         match i.fix() {
             FixKind::RestoreKnown => {
-                ops.extend(backup::snapshot_tree(reg, HKCU, &userchoice::base_key(&i.target)));
-                ops.extend(backup::snapshot_tree(reg, HKCU, &format!("Software\\Classes\\{}", i.target)));
+                ops.extend(backup::snapshot_tree(reg, HKCU, &userchoice::base_key(&i.target))?);
+                ops.extend(backup::snapshot_tree(reg, HKCU, &format!("Software\\Classes\\{}", i.target))?);
                 if needs_machine(reg, i).is_some() {
-                    ops.push(backup::snapshot_value(reg, HKLM, &format!("SOFTWARE\\Classes\\{}", i.target), ""));
+                    ops.push(backup::snapshot_value(reg, HKLM, &format!("SOFTWARE\\Classes\\{}", i.target), "")?);
                 }
             }
-            FixKind::ClearChoice => ops.extend(backup::snapshot_tree(reg, HKCU, &userchoice::choice_key(&i.target))),
-            FixKind::ClearUserDefault => ops.push(backup::snapshot_value(reg, HKCU, &format!("Software\\Classes\\{}", i.target), "")),
+            FixKind::ClearChoice => ops.extend(backup::snapshot_tree(reg, HKCU, &userchoice::choice_key(&i.target))?),
+            FixKind::ClearUserDefault => ops.push(backup::snapshot_value(reg, HKCU, &format!("Software\\Classes\\{}", i.target), "")?),
             FixKind::None => {}
         }
     }
-    ops
+    Ok(ops)
 }
 
 /// Applies the per-user part of each fix (steps 1-2 / clear choice / clear value).
@@ -337,7 +337,7 @@ mod tests {
         userchoice::write(&r, ".bat", "Applications\\notepad.exe", SID).unwrap();
         let issues = scan(&r, SID, &no_fs, &id);
         assert_eq!(issues[0].kind, Kind::NoHandler);
-        let ops = backup_ops(&r, &issues);
+        let ops = backup_ops(&r, &issues).unwrap();
         assert!(ops.iter().any(|o| matches!(o, Op::SetValue(Hive::LocalMachine, _, _, _))), "HKLM value backed up");
         let machine = fix_user(&r, &issues).unwrap();
         assert_eq!(machine, vec![known(".bat").unwrap()]);
@@ -383,7 +383,7 @@ mod tests {
         let r = windows_like();
         r.seed(HKCU, "Software\\Classes\\.bat\\OpenWithProgids", "x", Value::Sz(String::new()));
         let issues = scan(&r, SID, &no_fs, &id);
-        let ops = backup_ops(&r, &issues);
+        let ops = backup_ops(&r, &issues).unwrap();
         fix_user(&r, &issues).unwrap();
         assert!(!r.exists(HKCU, "Software\\Classes\\.bat"));
         backup::restore(&r, &ops, SID).unwrap();

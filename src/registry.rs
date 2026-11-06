@@ -112,6 +112,9 @@ impl Value {
 /// Read + write registry surface used by all association logic. `Send + Sync` so one instance
 /// can be shared by the scan, worker and icon threads.
 pub trait Registry: Send + Sync {
+    /// Strict reads for backups: absence is distinct from an unreadable or incomplete key.
+    fn snapshot_key(&self, hive: Hive, path: &str) -> Result<Option<KeySnapshot>>;
+    fn snapshot_value(&self, hive: Hive, path: &str, name: &str) -> Result<Option<Value>>;
     fn get(&self, hive: Hive, path: &str, name: &str) -> Option<Value>;
     fn values(&self, hive: Hive, path: &str) -> Vec<(String, Value)>;
     fn subkeys(&self, hive: Hive, path: &str) -> Vec<String>;
@@ -129,6 +132,11 @@ pub trait Registry: Send + Sync {
         self.get(hive, path, name)
             .and_then(|v| v.as_str().map(str::to_owned))
     }
+}
+
+pub struct KeySnapshot {
+    pub values: Vec<(String, Value)>,
+    pub children: Vec<String>,
 }
 
 /// Write allowlist. DefaultFast may only change file-association keys:
@@ -235,16 +243,20 @@ mod win {
         fn query(k: &Key, name: &str) -> Option<Value> {
             let n = wide(name);
             let mut kind = REG_VALUE_TYPE(0);
-            let mut size = 0u32;
-            // SAFETY: size-probe call; all pointers are valid locals.
+            let mut small = [0u8; 256];
+            let mut size = small.len() as u32;
+            // SAFETY: try a stack buffer first so small values complete in one syscall without heap allocation.
             let e = unsafe {
-                RegQueryValueExW(k.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), None, Some(&mut size))
+                RegQueryValueExW(k.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), Some(small.as_mut_ptr()), Some(&mut size))
             };
-            if e != ERROR_SUCCESS || size > 1 << 20 {
+            if e == ERROR_SUCCESS {
+                return Some(Value::from_bytes(kind.0, &small[..size as usize]));
+            }
+            if e != ERROR_MORE_DATA || size > 1 << 20 {
                 return None;
             }
             let mut buf = vec![0u8; size as usize];
-            // SAFETY: `buf` holds exactly `size` bytes, as reported by the probe.
+            // SAFETY: `buf` holds `size` bytes as reported by the first call.
             let e = unsafe {
                 RegQueryValueExW(
                     k.0,
@@ -260,6 +272,25 @@ mod win {
             }
             buf.truncate(size as usize);
             Some(Value::from_bytes(kind.0, &buf))
+        }
+
+        fn snapshot_query(k: &Key, hive: Hive, path: &str, name: &str) -> Result<Option<Value>> {
+            let n = wide(name);
+            let mut kind = REG_VALUE_TYPE(0);
+            let mut size = 0u32;
+            // SAFETY: valid locals and NUL-terminated name; probe before allocating.
+            let e = unsafe { RegQueryValueExW(k.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), None, Some(&mut size)) };
+            if missing(e) { return Ok(None); }
+            if e != ERROR_SUCCESS { return Err(fail("Read backup value", hive, path, e)); }
+            if size > 1 << 20 { return Err(Error::Invalid(format!("Backup value too large: {hive}\\{path}"))); }
+            let mut bytes = vec![0u8; size as usize];
+            // SAFETY: buffer has the probed size; concurrent growth produces an error.
+            let e = unsafe { RegQueryValueExW(k.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), Some(bytes.as_mut_ptr()), Some(&mut size)) };
+            if e != ERROR_SUCCESS { return Err(fail("Read backup value", hive, path, e)); }
+            bytes.truncate(size as usize);
+            let value = Value::from_bytes(kind.0, &bytes);
+            // Preserve malformed strings and other unusual payloads byte-for-byte.
+            Ok(Some(if value.to_bytes() == bytes { value } else { Value::Raw(kind.0, bytes) }))
         }
 
         fn delete_tree_inner(h: Hive, path: &str) -> std::result::Result<(), WIN32_ERROR> {
@@ -281,6 +312,46 @@ mod win {
     }
 
     impl Registry for WinRegistry {
+        fn snapshot_value(&self, hive: Hive, path: &str, name: &str) -> Result<Option<Value>> {
+            let k = match open(hive, path, KEY_QUERY_VALUE) {
+                Ok(k) => k,
+                Err(e) if missing(e) => return Ok(None),
+                Err(e) => return Err(fail("Open backup value", hive, path, e)),
+            };
+            Self::snapshot_query(&k, hive, path, name)
+        }
+
+        fn snapshot_key(&self, hive: Hive, path: &str) -> Result<Option<KeySnapshot>> {
+            let k = match open(hive, path, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS) {
+                Ok(k) => k,
+                Err(e) if missing(e) => return Ok(None),
+                Err(e) => return Err(fail("Open backup key", hive, path, e)),
+            };
+            let mut values = Vec::new();
+            let mut name = vec![0u16; 16384];
+            for index in 0.. {
+                let mut len = name.len() as u32;
+                // SAFETY: name has len writable UTF-16 slots.
+                let e = unsafe { RegEnumValueW(k.0, index, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None) };
+                if e == ERROR_NO_MORE_ITEMS { break; }
+                if e != ERROR_SUCCESS { return Err(fail("Enumerate backup values", hive, path, e)); }
+                let n = String::from_utf16(&name[..len as usize]).map_err(|_| Error::Invalid("Invalid registry value name".into()))?;
+                let v = Self::snapshot_query(&k, hive, path, &n)?.ok_or_else(|| Error::Invalid("Registry changed while backing up".into()))?;
+                values.push((n, v));
+            }
+            let mut children = Vec::new();
+            let mut name = [0u16; 256];
+            for index in 0.. {
+                let mut len = name.len() as u32;
+                // SAFETY: name has len writable UTF-16 slots.
+                let e = unsafe { RegEnumKeyExW(k.0, index, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None) };
+                if e == ERROR_NO_MORE_ITEMS { break; }
+                if e != ERROR_SUCCESS { return Err(fail("Enumerate backup keys", hive, path, e)); }
+                children.push(String::from_utf16(&name[..len as usize]).map_err(|_| Error::Invalid("Invalid registry key name".into()))?);
+            }
+            Ok(Some(KeySnapshot { values, children }))
+        }
+
         fn get(&self, hive: Hive, path: &str, name: &str) -> Option<Value> {
             let k = open(hive, path, KEY_QUERY_VALUE).ok()?;
             Self::query(&k, name)
@@ -291,22 +362,35 @@ mod win {
                 return Vec::new();
             };
             let mut out = Vec::new();
-            let mut name = vec![0u16; 16384];
+            let mut name = [0u16; 512];
+            let mut data = [0u8; 256];
             for index in 0.. {
-                let mut len = name.len() as u32;
-                // SAFETY: `name` has `len` u16 slots; other out params are unused.
+                let mut nlen = name.len() as u32;
+                let mut dlen = data.len() as u32;
+                let mut kind = 0u32;
+                // SAFETY: `name` has `nlen` u16 slots and `data` has `dlen` byte slots.
                 let e = unsafe {
-                    RegEnumValueW(k.0, index, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None)
+                    RegEnumValueW(k.0, index, Some(PWSTR(name.as_mut_ptr())), &mut nlen, None, Some(&mut kind), Some(data.as_mut_ptr()), Some(&mut dlen))
                 };
                 if e == ERROR_NO_MORE_ITEMS {
                     break;
                 }
-                if e != ERROR_SUCCESS {
-                    continue;
-                }
-                let n = String::from_utf16_lossy(&name[..len as usize]);
-                if let Some(v) = Self::query(&k, &n) {
-                    out.push((n, v));
+                if e == ERROR_SUCCESS {
+                    let n = String::from_utf16_lossy(&name[..nlen as usize]);
+                    out.push((n, Value::from_bytes(kind, &data[..dlen as usize])));
+                } else if e == ERROR_MORE_DATA {
+                    let mut big = vec![0u16; 16384];
+                    let mut blen = big.len() as u32;
+                    // SAFETY: `big` has `blen` u16 slots; value payload is fetched via `Self::query`.
+                    let e2 = unsafe {
+                        RegEnumValueW(k.0, index, Some(PWSTR(big.as_mut_ptr())), &mut blen, None, None, None, None)
+                    };
+                    if e2 == ERROR_SUCCESS {
+                        let n = String::from_utf16_lossy(&big[..blen as usize]);
+                        if let Some(v) = Self::query(&k, &n) {
+                            out.push((n, v));
+                        }
+                    }
                 }
                 if index > 100_000 {
                     break;
@@ -451,6 +535,7 @@ mod mem {
         clock: Mutex<u64>,
         /// Paths (lowercase prefixes) whose writes fail with ACCESS_DENIED, to test rollback.
         pub deny: Mutex<Vec<String>>,
+        pub read_deny: Mutex<Vec<String>>,
     }
 
     impl MemRegistry {
@@ -496,6 +581,12 @@ mod mem {
             node.values.insert(name.to_lowercase(), (name.to_owned(), value));
             node.time = now;
         }
+        fn read_denied(&self, hive: Hive, path: &str) -> Result<()> {
+            if self.read_deny.lock().unwrap().iter().any(|p| path.to_lowercase().starts_with(p)) {
+                return Err(Error::Invalid(format!("Cannot read backup key: {hive}\\{path}")));
+            }
+            Ok(())
+        }
         fn denied(&self, hive: Hive, path: &str) -> Result<()> {
             let p = path.to_lowercase();
             if self.deny.lock().unwrap().iter().any(|d| p.starts_with(d)) {
@@ -535,6 +626,15 @@ mod mem {
     }
 
     impl Registry for MemRegistry {
+        fn snapshot_key(&self, hive: Hive, path: &str) -> Result<Option<KeySnapshot>> {
+            self.read_denied(hive, path)?;
+            Ok(self.node(hive, path).map(|node| KeySnapshot { values: node.values.into_values().collect(), children: self.subkeys(hive, path) }))
+        }
+        fn snapshot_value(&self, hive: Hive, path: &str, name: &str) -> Result<Option<Value>> {
+            self.read_denied(hive, path)?;
+            Ok(self.get(hive, path, name))
+        }
+
         fn get(&self, hive: Hive, path: &str, name: &str) -> Option<Value> {
             self.node(hive, path)?.values.get(&name.to_lowercase()).map(|v| v.1.clone())
         }

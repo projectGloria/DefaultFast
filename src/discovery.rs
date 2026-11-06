@@ -7,9 +7,25 @@ use crate::{
     shell,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const HKCR: Hive = Hive::ClassesRoot;
+
+fn search_dirs() -> &'static [PathBuf] {
+    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut dirs = Vec::new();
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            dirs.push(Path::new(&root).join("System32"));
+            dirs.push(Path::new(&root).to_path_buf());
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+        dirs
+    })
+}
 
 /// Extracts the executable from a shell command line (already env-expanded):
 /// `"C:\x\vlc.exe" --started-from-file "%1"` -> `C:\x\vlc.exe`. Pure; no file system access.
@@ -46,15 +62,8 @@ pub fn resolve_command_exe(command: &str) -> Option<String> {
         return None;
     }
     let name = if p.extension().is_none() { format!("{exe}.exe") } else { exe };
-    let mut dirs = Vec::new();
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        dirs.push(Path::new(&root).join("System32"));
-        dirs.push(Path::new(&root).to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-    dirs.into_iter()
+    search_dirs()
+        .iter()
         .map(|d| d.join(&name))
         .find(|c| c.is_file())
         .map(|c| c.to_string_lossy().into_owned())
@@ -89,10 +98,11 @@ pub fn prog_command(reg: &dyn Registry, prog_id: &str) -> Option<String> {
     verbs.iter().find_map(|v| reg.string(HKCR, &format!("{shell_key}\\{v}\\command"), "").filter(|c| !c.is_empty()))
 }
 
-/// Caches ProgID -> executable lookups; thousands of extensions share a handful of ProgIDs.
+/// Caches ProgID -> executable / AUMID lookups; thousands of extensions share a handful of ProgIDs.
 struct ProgCache<'a> {
     reg: &'a dyn Registry,
     exe: HashMap<String, Option<String>>,
+    app: HashMap<String, Option<(String, String)>>,
 }
 
 impl ProgCache<'_> {
@@ -105,12 +115,26 @@ impl ProgCache<'_> {
         self.exe.insert(key, v.clone());
         v
     }
+    fn app_model(&mut self, prog_id: &str) -> Option<(String, String)> {
+        let key = prog_id.to_lowercase();
+        if let Some(v) = self.app.get(&key) {
+            return v.clone();
+        }
+        let app_key = format!("{prog_id}\\Application");
+        let v = self.reg.string(HKCR, &app_key, "AppUserModelID").map(|aumid| {
+            let name = self.reg.string(HKCR, &app_key, "ApplicationName").map(|n| shell::load_indirect(&n)).unwrap_or_default();
+            (aumid, name)
+        });
+        self.app.insert(key, v.clone());
+        v
+    }
 }
 
 /// Pass 1a: every extension and URL protocol under HKCR.
 pub fn scan_types(reg: &dyn Registry, cancel: &dyn Fn() -> bool) -> (Vec<FileType>, Vec<Protocol>) {
     let mut types = Vec::new();
     let mut protocols = Vec::new();
+    let mut prog_friendly: HashMap<String, String> = HashMap::new();
     for key in reg.subkeys(HKCR, "") {
         if cancel() {
             break;
@@ -121,7 +145,14 @@ pub fn scan_types(reg: &dyn Registry, cancel: &dyn Fn() -> bool) -> (Vec<FileTyp
             let friendly = if prog_id.is_empty() {
                 String::new()
             } else {
-                reg.string(HKCR, &prog_id, "").unwrap_or_default()
+                let low = prog_id.to_lowercase();
+                if let Some(f) = prog_friendly.get(&low) {
+                    f.clone()
+                } else {
+                    let f = reg.string(HKCR, &prog_id, "").unwrap_or_default();
+                    prog_friendly.insert(low, f.clone());
+                    f
+                }
             };
             let friendly = if friendly.is_empty() || friendly.starts_with('@') {
                 format!("{} file", ext[1..].to_uppercase())
@@ -194,8 +225,9 @@ fn stem(exe: &str) -> String {
 /// Pass 1b: programs from RegisteredApplications, HKCR\Applications, App Paths and every
 /// extension's OpenWithProgids / OpenWithList.
 pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -> bool) -> Vec<Program> {
-    let mut cache = ProgCache { reg, exe: HashMap::new() };
+    let mut cache = ProgCache { reg, exe: HashMap::new(), app: HashMap::new() };
     let mut out: Vec<Program> = Vec::new();
+    let mut batch: Vec<Program> = Vec::new();
 
     // RegisteredApplications -> Capabilities (the authoritative "this app supports X" list).
     for (hive, machine) in [(Hive::CurrentUser, false), (Hive::LocalMachine, true)] {
@@ -225,7 +257,7 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
                         // so a resolvable command wins; only command-less ProgIDs are packaged.
                         if let Some(exe) = cache.exe(prog) {
                             p.exe = exe;
-                        } else if let Some(aumid) = reg.string(HKCR, &format!("{prog}\\Application"), "AppUserModelID") {
+                        } else if let Some((aumid, _)) = cache.app_model(prog) {
                             p.aumid = aumid;
                         }
                     }
@@ -239,7 +271,7 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
                 }
             }
             if !p.supports.is_empty() {
-                merge(&mut out, vec![p]);
+                batch.push(p);
             }
         }
     }
@@ -261,7 +293,7 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
                 p.add_support(&ext, &key);
             }
         }
-        merge(&mut out, vec![p]);
+        batch.push(p);
     }
 
     // App Paths: installed programs that may declare nothing but should be findable.
@@ -270,7 +302,7 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
         for exe_name in reg.subkeys(hive, base) {
             if let Some(path) = reg.string(hive, &format!("{base}\\{exe_name}"), "") {
                 if let Some(exe) = resolve_command_exe(&format!("\"{}\"", path.trim_matches('"'))) {
-                    merge(&mut out, vec![program(stem(&exe), 0, exe)]);
+                    batch.push(program(stem(&exe), 0, exe));
                 }
             }
         }
@@ -278,7 +310,6 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
 
     // Per-extension OpenWithProgids / OpenWithList and the class default: attaches the
     // reverse mapping (exe -> targets) that most installers only record here.
-    let mut found: Vec<Program> = Vec::new();
     for t in types {
         if cancel() {
             return out;
@@ -294,18 +325,17 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
             if let Some(exe) = cache.exe(&prog) {
                 let mut p = program(stem(&exe), 0, exe);
                 p.add_support(&t.ext, &prog);
-                found.push(p);
-            } else if let Some(aumid) = reg.string(HKCR, &format!("{prog}\\Application"), "AppUserModelID") {
-                let name = reg.string(HKCR, &format!("{prog}\\Application"), "ApplicationName").map(|n| shell::load_indirect(&n)).unwrap_or_default();
+                batch.push(p);
+            } else if let Some((aumid, name)) = cache.app_model(&prog) {
                 // Unnamed for now; the packaged-app pass supplies the display name (rank 3).
                 let name = if name.is_empty() { aumid.clone() } else { name };
                 let mut p = Program { name, aumid, ..Program::default() };
                 p.add_support(&t.ext, &prog);
-                found.push(p);
+                batch.push(p);
             }
         }
     }
-    merge(&mut out, found);
+    merge(&mut out, batch);
     out
 }
 
@@ -313,6 +343,7 @@ pub fn scan_programs(reg: &dyn Registry, types: &[FileType], cancel: &dyn Fn() -
 /// from version resources for programs that only had a file stem.
 pub fn scan_shell(programs: &mut Vec<Program>, cancel: &dyn Fn() -> bool) {
     let mut found = Vec::new();
+    let shortcuts = shell::ShortcutResolver::new();
     for dir in shell::start_menu_dirs() {
         let mut stack = vec![dir];
         while let Some(d) = stack.pop() {
@@ -326,7 +357,7 @@ pub fn scan_shell(programs: &mut Vec<Program>, cancel: &dyn Fn() -> bool) {
                 if kind.is_dir() && !kind.is_symlink() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
-                    if let Some(target) = shell::resolve_shortcut(&path) {
+                    if let Some(target) = shortcuts.resolve(&path) {
                         if target.to_ascii_lowercase().ends_with(".exe") && !target.starts_with("\\\\") && Path::new(&target).is_file() {
                             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                             found.push(program(name, 2, target));
