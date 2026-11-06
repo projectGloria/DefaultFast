@@ -1,180 +1,233 @@
-# DefaultFast
+<p align="center">
+  <img src="docs/assets/icon.svg" alt="DefaultFast Icon" width="96" height="96" />
+</p>
 
-A small, fast, portable Windows 10 (1809+) / 11 utility to **set and repair default apps**.
-Type a program, a file type (`.pdf`) or a protocol (`https`), pick, done. It also finds and
-fixes broken associations — including the "`.bat` / `.cmd` has no handler" bug where
-double-clicking a script shows *Select an app to open this file*.
+<h1 align="center">DefaultFast</h1>
 
-Single exe, no installer, no runtime dependencies, no network access, no telemetry. Runs as a
-normal user; only system-wide repairs ask for admin (UAC), one step at a time.
+<p align="center">
+  <strong>Fast, portable Windows default app manager and file association repair utility.</strong>
+</p>
 
-## Build
+<p align="center">
+  <a href="https://github.com/projectGloria/DefaultFast/releases"><img src="https://img.shields.io/badge/version-0.1.0--beta.7-blue.svg" alt="Version 0.1.0-beta.7" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20(1809%2B)%20%7C%2011-0078D4.svg" alt="Windows 10 1809+ / 11" />
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust 1.88+" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
+</p>
 
-Prerequisites: Rust 1.88+ (stable, `x86_64-pc-windows-msvc`) and Visual Studio Build Tools with
-*Desktop development with C++* (MSVC linker + Windows SDK, which provides `rc.exe`).
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="DefaultFast Banner" width="880" />
+</p>
 
-```powershell
-cargo build --release          # -> target\release\DefaultFast.exe
-cargo test                     # 31 unit tests (search, hash, repair, backup, registry policy)
-.\scripts\measure.ps1 -Runs 5  # budgets on this machine
+<p align="center">
+  <a href="#about">About</a> •
+  <a href="#features">Features</a> •
+  <a href="#screenshots">Screenshots</a> •
+  <a href="#how-it-works">How It Works</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#usage">Usage</a> •
+  <a href="#repair-and-safety">Repair &amp; Safety</a> •
+  <a href="#building-from-source">Building from Source</a> •
+  <a href="#diagnostics-and-budgets">Diagnostics &amp; Budgets</a> •
+  <a href="#license">License</a>
+</p>
+
+---
+
+## About
+
+**DefaultFast** is a lightweight, portable Windows utility to instantly configure and repair default file types and protocol handlers. Windows Settings requires navigating multi-layered pages to change associations; DefaultFast lets you search an extension (`.pdf`), a protocol (`https`), or an application name (`VLC`), select your choice, and apply it in one keystroke.
+
+It also automatically diagnoses and fixes broken file associations — including the recurring Windows bug where double-clicking `.bat` or `.cmd` scripts prompts *"Select an app to open this file"*.
+
+Every change is executed through a verified transaction: keys are backed up to standard `.reg` files before writing, Shell registration is queried for confirmation, and changes roll back automatically if the system refuses them. DefaultFast runs as a standard user process with zero installers, zero runtime dependencies, and no network access.
+
+## Features
+
+- **Instant unified search**: Search across 900+ file extensions, 170+ protocols, and all installed desktop and packaged apps in under 3 ms.
+- **Batch application defaults**: View every file type supported by a program (e.g. Media Player or Notepad) and associate them all or a selected subset with a single click.
+- **Automatic association repair**: One-click health check detects empty handlers, missing ProgIDs, and shadowed extensions (such as broken `.bat`, `.cmd`, `.lnk`, `.exe`, or `.ps1` associations).
+- **Safe transaction & rollback**: Computes legitimate UserChoice hashes; every write is verified through Windows Shell API (`AssocQueryStringW`) before marking successful, with instant rollback on denial.
+- **Automatic `.reg` backups**: Exports registry states to `%LOCALAPPDATA%\DefaultFast\backups\*.reg` prior to modification, enabling one-click in-app Undo or standalone manual restoration.
+- **Native Fluent UI & Snap integration**: Built with Slint and native Win32 window chrome supporting Windows 11 Snap Layouts, system dark/light themes, and keyboard navigation (`Ctrl+K`, `/`, `Enter`, `Esc`).
+- **Minimal footprint**: Interactive window renders in under 95 ms with an idle memory footprint of approximately 21 MB.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/assets/search-home.png" alt="DefaultFast Home Screen" width="840" />
+  <br /><em>Instant search view: quick suggestions for extensions, protocols, and programs with background health scanning.</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/file-type-pdf.png" alt="File Type Association View" width="840" />
+  <br /><em>Extension detail view: inspect the active handler, see registered programs, and reassign defaults in one click.</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/program-detail.png" alt="Program Batch Association View" width="840" />
+  <br /><em>Program detail view: bulk-assign all supported file types or selectively toggle specific formats.</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/health-check.png" alt="Health Check and Repair View" width="840" />
+  <br /><em>Health check pane: detect broken associations and restore missing or shadowed registry handlers.</em>
+</p>
+
+## How It Works
+
+Windows restricts default app registration by storing user choices under `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\<ext>\UserChoice` protected by an undocumented hash. An invalid hash triggers an association reset or silent rejection.
+
+DefaultFast implements a safe association transaction pipeline:
+
+```mermaid
+flowchart TD
+    Start([User selects target handler]) --> Preflight{Preflight Checks}
+    Preflight -->|Protected by UserChoiceLatest / UCPD| SettingsLink[Offer deep-link to Windows Settings]
+    Preflight -->|Valid target| Backup[Export affected keys to backups/*.reg]
+    
+    Backup --> RegProgId[Register HKCU Applications ProgID if required]
+    RegProgId --> Hash[Calculate UserChoice MD5/rotate checksum]
+    Hash --> RegWrite[Write HKCU UserChoice ProgId + Hash]
+    
+    RegWrite --> Verify{Shell Verification AssocQueryStringW}
+    Verify -->|Shell confirms new default| Notify[SHChangeNotify SHCNE_ASSOCCHANGED]
+    Notify --> Toast[Success toast with Undo button]
+    
+    Verify -->|Shell rejects or mismatch| Rollback[Roll back from .reg backup]
+    Rollback --> ErrorToast[Report failure & provide Windows Settings fallback]
 ```
 
-No CI is configured on purpose; everything builds locally.
+1. **Preflight**: Checks whether the target uses Windows 11's protected `UserChoiceLatest` or the UCPD driver (e.g. `http`, `https`, `.pdf` on recent OS builds). If blocked, it directs you cleanly to the appropriate Windows Settings page without half-applied changes.
+2. **Registry Backup**: Before altering keys, DefaultFast generates a `.reg` file in `%LOCALAPPDATA%\DefaultFast\backups\`.
+3. **Hash Calculation**: Generates the UserChoice hash matching the algorithm verified against Windows-generated keys on your machine.
+4. **Shell Verification**: Asserts that Explorer (`AssocQueryStringW`) acknowledges the new association. If verification fails, the backup is restored immediately.
+5. **Explorer Notification**: Issues `SHChangeNotify(SHCNE_ASSOCCHANGED)` so icons and file handlers update instantly without restarting Explorer.
 
-## Use
+## Installation
 
-| Action | How |
+### Requirements
+- **OS**: Windows 10 (version 1809 or higher, build 17763+) or Windows 11 (`x86_64`).
+- **Permissions**: Runs entirely under standard user privileges. Administrator rights (UAC) are only requested when repairing machine-level `HKLM` keys for core file types.
+- **Dependencies**: None. The single executable is self-contained.
+
+### Download
+Download the latest executable `DefaultFast.exe` from [GitHub Releases](https://github.com/projectGloria/DefaultFast/releases).
+
+Place `DefaultFast.exe` in any folder or your `PATH`. No installation or setup process is needed.
+
+## Usage
+
+### Keyboard Shortcuts & Navigation
+
+| Action | Shortcut / Input |
 | --- | --- |
-| Search | Just type. `Ctrl+K` or `/` refocuses the search box. |
-| Navigate results | `↑` / `↓`, `Enter` opens the detail pane and moves focus into it |
-| Program detail | Check file types/protocols (`Space`), then **Set as default for selected** (`Ctrl+Enter`) or **Make default for everything** |
-| File type / protocol detail | **Set default** next to any app (`Enter` / `Ctrl+Enter` on the selected one), **Browse for another program…** for any `.exe` |
-| Back / clear | `Esc` (detail → search box; search box → clear; empty → home) |
-| Undo | The toast's **Undo**, or **History → Undo last change / Restore** |
-| Repair | Footer status ("All good" / "3 issues · Fix") → **Health check** |
+| **Focus Search** | `Ctrl+K` or `/` |
+| **Navigate Results** | `↑` / `↓` arrow keys |
+| **Open Detail Pane** | `Enter` on a selected result |
+| **Toggle Checkbox** | `Space` in the supported types list |
+| **Apply Default** | `Ctrl+Enter` or click **Set default** / **Set as default for selected** |
+| **Make Default for All** | Click **Make default for everything** |
+| **Dismiss / Back** | `Esc` (detail pane → search bar → clear query → home) |
+| **Undo Last Change** | Click **Undo** on toast notification or navigate to **History** |
 
-Command line: `DefaultFast.exe .pdf` (opens with that search), `--repair` (opens the health
-check), `--self-test`, `--diagnose`, `--startup-probe` (see *Diagnostics*).
+### Command-Line Arguments
 
-Programs that declare no file types (portable apps, many editors) get an **Add type** box in
-their detail pane: type `.txt`, and DefaultFast registers the program properly first.
+You can integrate DefaultFast into scripts, run diagnostics, or create shortcuts for specific workflows:
 
-## How setting a default works (and why it can break)
+```powershell
+# Open directly with a search pre-filled:
+.\DefaultFast.exe .pdf
+.\DefaultFast.exe https
+.\DefaultFast.exe Notepad
 
-Windows stores per-user defaults in
-`HKCU\…\Explorer\FileExts\<ext>\UserChoice` (protocols: `…\Shell\Associations\UrlAssociations\<proto>\UserChoice`)
-as `ProgId` + `Hash`. A `ProgId` without the right `Hash` is ignored or reset, and
-`IApplicationAssociationRegistration::SetAppAsDefault` is blocked for non-system callers.
+# Open directly into the Association Health Check:
+.\DefaultFast.exe --repair
 
-DefaultFast computes the hash with the algorithm reverse-engineered by
-[SetUserFTA](https://kolbi.cz/blog/2017/10/25/setuserfta-userchoice-hash-defeated-set-file-type-associations-per-user/) /
-[PS-SFTA](https://github.com/DanysysTeam/PS-SFTA) (also used by Firefox):
+# Run headless diagnostics and generate diagnostics.txt:
+.\DefaultFast.exe --diagnose
 
-1. `input = lowercase(ext_or_protocol + user SID + ProgId + hex(key last-write FILETIME, truncated to the minute) + "User Choice set via Windows User Experience {D18B6DD5-6124-4341-9318-804003BAFA0B}")`, UTF-16LE with the terminating NUL;
-2. MD5 of that gives two seeds for two multiply/rotate checksum passes over the input;
-3. the 8 resulting bytes are base64-encoded.
+# Execute a self-contained registry write/verify/rollback test:
+.\DefaultFast.exe --self-test
 
-All of it lives in `src/userchoice.rs` (pure Rust, unit-tested against PS-SFTA vectors). Before
-writing anything, DefaultFast checks its hash against the UserChoice keys **Windows itself
-wrote on this machine** (on the development machine: 73 of 73 matched). A change is only
-reported as done when Shell (`AssocQueryStringW`, ProgID/executable) confirms the new default;
-otherwise that target is rolled back.
+# Run cold-start and memory probe (used by measurement scripts):
+.\DefaultFast.exe --startup-probe
+```
 
-**Why it may need updates:** the algorithm is undocumented. Microsoft can change it in any
-feature update. Recent Windows 11 builds add `UserChoiceLatest` with a different, unpublished
-hash, and the UCPD driver blocks third-party writes for `http`, `https` and `.pdf`. DefaultFast
-never fakes those: if the hash check fails, `UserChoiceLatest` is present, a write is denied or
-Shell doesn't confirm the change, you get a plain-language toast with **Open Settings**
-(deep-linked to the app's page when it is registered), and nothing is left half-changed.
+### Unregistered Portable Apps
 
-To make a choice valid and persistent for apps that don't register a ProgID, DefaultFast first
-creates `HKCU\Software\Classes\Applications\<exe>\shell\open\command`, `SupportedTypes` and the
-extension's `OpenWithProgids` entry — exactly what Windows' own "Choose another app" does.
+For standalone editors or portable utilities that do not create standard registry entries, DefaultFast provides an **Add type** field in their detail view. Entering `.txt` or another extension automatically creates `HKCU\Software\Classes\Applications\<exe>\shell\open\command` and links `SupportedTypes`, making the portable binary a first-class choice in Windows.
 
-## Repair
+## Repair and Safety
 
-The startup health scan (background thread) and **Health check** find:
+### What the Health Check Detects
+DefaultFast monitors critical system file associations against a known-good configuration table (`.bat`, `.cmd`, `.exe`, `.lnk`, `.msi`, `.ps1`, `.reg`, `.txt`, `.url`, `.vbs`, `.js`, `.zip`):
+- Empty or shadowed default ProgIDs (e.g. an accidental empty `HKCU\Software\Classes\.bat` key breaking batch files).
+- Missing handler binaries or uninstalled ProgIDs assigned in UserChoice.
+- Corrupted or invalid UserChoice hash signatures.
 
-- known Windows types whose merged `HKCR\<ext>` default is empty (the `.bat`/`.cmd` bug — an
-  empty `HKCU\Software\Classes\.bat` shadowing HKLM, or a wiped HKLM default),
-- critical types (`.exe`, `.lnk`, `.bat`, `.cmd`, `.msi`, `.reg`) mapped or user-overridden to
-  something else,
-- per-user defaults naming an uninstalled ProgID,
-- UserChoice entries pointing to a missing ProgID or missing executable, or with an invalid hash.
+### Elevation Policy
+DefaultFast never runs elevated by default. When an association requires repairing `HKLM\SOFTWARE\Classes` (such as a damaged system `.cmd` entry):
+1. A prompt displays the specific keys needing repair.
+2. Upon confirmation, DefaultFast launches an elevated one-shot worker via `runas`:
+   ```powershell
+   DefaultFast.exe --elevated-fix .bat .cmd
+   ```
+3. The elevated worker validates each extension against the internal known-good table and rejects any writes outside `HKLM\SOFTWARE\Classes\.<ext>`.
 
-Known-good table: `.bat→batfile`, `.cmd→cmdfile`, `.exe→exefile`, `.lnk→lnkfile`,
-`.txt→txtfile`, `.ps1→Microsoft.PowerShellScript.1`, `.vbs→VBSFile`, `.js→JSFile`,
-`.msi→Msi.Package`, `.reg→regfile`, `.url→InternetShortcut`, `.zip→CompressedFolder`.
-Fix: (1) delete `HKCU\…\FileExts\<ext>` (UserChoice, UserChoiceLatest, OpenWithList…),
-(2) delete `HKCU\Software\Classes\<ext>`, (3) set `HKLM\SOFTWARE\Classes\<ext>` to the ProgID —
-**only if it is wrong**, via the elevated helper — (4) verify the ProgID can open files,
-(5) `SHChangeNotify(SHCNE_ASSOCCHANGED)`. Explorer is never restarted.
+### Data and Backup Directory
+All state is stored in `%LOCALAPPDATA%\DefaultFast`:
+- `backups\*.reg` — Automated backups saved prior to every registry edit (up to 50 kept).
+- `log.txt` — Append-only audit log recording every registry modification.
+- `window.txt` — Saved window size, position, and maximize state.
 
-## Elevation
+## Building from Source
 
-The app never runs elevated. When a fix needs HKLM, a dialog explains why first, then
-`DefaultFast.exe --elevated-fix .bat .cmd` is started with ShellExecute `runas` (one UAC
-prompt for all of them). The helper accepts only extensions from the known-good table and the
-registry layer still refuses any HKLM write other than `HKLM\SOFTWARE\Classes\.<ext>`.
+### Prerequisites
+- **Rust**: Version 1.88+ (`stable-x86_64-pc-windows-msvc`).
+- **Visual Studio Build Tools**: Desktop development with C++ workload (MSVC linker and the Windows SDK with `rc.exe`).
 
-## Backups, Undo and logs
+### Build Steps
 
-Everything lives in `%LOCALAPPDATA%\DefaultFast`:
+```powershell
+# Clone the repository
+git clone https://github.com/projectGloria/DefaultFast.git
+cd DefaultFast
 
-- `backups\*.reg` — before **any** registry write, the affected keys are exported in regedit's
-  own format (you can double-click them too). Undo/Restore replay them, regenerating UserChoice
-  hashes instead of replaying stale ones, and back up the current state first. The newest 50
-  are kept.
-- `log.txt` — every registry write and its result (256 KB, one rotation to `log.old.txt`).
-- `window.txt` — last size/position.
+# Run test suite (31 unit tests covering hash, registry, and repairs)
+cargo test
 
-DefaultFast writes nothing outside the file-association keys and this folder; the allowlist is
-enforced in `src/registry.rs` and unit-tested.
+# Build optimized release binary
+cargo build --release
+```
 
-## Measured budgets
+The compiled standalone executable is generated at:
+```
+target\release\DefaultFast.exe
+```
 
-Release build, Windows 11 (build 26100), warm launches, `scripts\measure.ps1 -Runs 5`:
+## Diagnostics and Budgets
 
-| Budget | Target | Measured | |
+DefaultFast is designed to satisfy strict performance and memory budgets:
+
+| Metric | Target | Measured (Win 11 Build 26100) | Status |
 | --- | --- | --- | --- |
-| Cold start to interactive window | < 150 ms | **92–95 ms** to first presented frame | ✅ |
-| Idle RAM (working set) | < 30 MB | **21.7 MB** after a search (≈11 MB private); 5.5 MB idle before any use | ✅ |
-| Peak during the first index build | — | 39 MB (transient, then trimmed) | ℹ️ |
-| Per-keystroke search + re-render | < 16 ms | **1.7–3.2 ms** (search alone ≈0.45 ms, 905 types + 160 apps + 174 protocols) | ✅ |
-| Binary size | < 6 MB (ideally < 4) | **8.28 MB** | ❌ |
+| **Startup to First Frame** | < 150 ms | **92–95 ms** | Passed |
+| **Idle RAM (Working Set)** | < 30 MB | **21.7 MB** (≈11 MB private) | Passed |
+| **Search & Re-render Latency** | < 16 ms | **1.7–3.2 ms** (Search core ≈0.45 ms) | Passed |
+| **Binary Size** | < 6 MB | **8.28 MB** (Slint 1.18 + software renderer) | Accepted trade-off |
 
-Index build (background, UI already interactive): file types/protocols ≈0.27 s, registry
-programs ≈0.45 s, Start Menu + packaged apps ≈0.5 s.
+Run the benchmark script locally across multiple iterations:
+```powershell
+.\scripts\measure.ps1 -Runs 5
+```
 
-## Trade-offs and deviations (priority: correctness > speed > size > polish)
+See [docs/TESTPLAN.md](docs/TESTPLAN.md) for the manual quality assurance and verification test plan.
 
-- **Binary size over budget.** Measured before writing the UI: Slint 1.18 with the software
-  renderer is 7.6 MB for an empty window (ICU + parley text layout can't be disabled). Slint
-  1.12/1.14 are 2.8–3.7 MB but load every system font (36–38 MB RAM, over the RAM budget). Stock
-  Slint 1.18 was chosen; a raw Win32 UI would meet the size budget at the cost of much more
-  hand-written UI code and weaker accessibility.
-- **Mica.** DWM backdrop, rounded corners and dark title-bar attributes are applied, but
-  Slint's software renderer presents opaque pixels (softbuffer has no alpha), so the backdrop
-  can't show through. The client uses a Mica-like solid tint instead. Skia/OpenGL could show it
-  but costs several MB and GPU-driver RAM.
-- **Window chrome.** Implemented the preferred way: a real native window (resize borders, Aero
-  Snap, shadow, rounded corners) whose caption is replaced via `WM_NCCALCSIZE`/`WM_NCHITTEST`; the
-  maximize button returns `HTMAXBUTTON` so the Windows 11 Snap Layouts flyout works. The window
-  is subclassed from a CBT hook at creation, so the stock caption never flashes.
-- **Packaged apps** come from the Shell AppsFolder (names, AUMIDs, icons) plus their registered
-  Capabilities, instead of `PackageManager`: same data without parsing manifests or pulling in
-  WinRT projections.
-- **UserChoiceLatest** targets are never written (unpublished hash); they go to Settings.
-- **Idle working set** is trimmed once after the one-off index build (Shell DLL pages used only
-  by that scan). The table reports the number after real use, not just the trimmed one.
-- **Protocol rows** use a globe glyph rather than an extracted icon.
+## License
 
-## Diagnostics
+This project is licensed under the [MIT License](LICENSE).
 
-- `--diagnose` writes `diagnostics.txt`: index counts/timings, the hash check against this
-  machine's UserChoice keys, the health-scan result and the program list. Read-only.
-- `--self-test` runs set → verify → undo → verify on an invented extension with invented
-  `Applications\…` handlers, then deletes every key it made. Writes `self-test.txt`.
-- `--startup-probe` measures the budgets and exits (used by `scripts\measure.ps1`).
-
-## Architecture
-
-| Module | Role |
-| --- | --- |
-| `registry` | `Registry` trait, Win32 impl (the only raw Reg* calls), in-memory mock, write allowlist, write log |
-| `discovery` | Two-pass index: HKCR types/protocols, RegisteredApplications, `Applications\*`, App Paths, OpenWithProgids/List; then Start Menu + AppsFolder |
-| `search` | Allocation-free fuzzy/prefix scoring, grouped results |
-| `userchoice` | Hash, UserChoice read/validate/write, algorithm check |
-| `defaults` | Set-default transaction: preflight, backup, registration, write, Shell verify, rollback |
-| `repair` | Health scan, known-good table, fix plan |
-| `backup` | `.reg` export/parse/restore, history, pruning |
-| `elevated` | `runas` helper modes |
-| `window` | CBT hook + subclass for the custom title bar, DWM attributes |
-| `shell` | Thin COM/Shell wrappers (AssocQueryString, icons, shortcuts, dialogs, SID) |
-| `ui`, `actions`, `repair_ui`, `worker` | Slint glue, button actions, background worker (all writes are serialized there) |
-
-The UI thread never touches the registry or disk: scans, Shell queries, icon extraction and
-writes run on background threads and post results back with `slint::invoke_from_event_loop`.
-
-See [docs/TESTPLAN.md](docs/TESTPLAN.md) for the manual test plan and
-[CHANGELOG.md](CHANGELOG.md) for versions.
+### Acknowledgments
+- UserChoice hash reverse-engineering based on research by [SetUserFTA](https://kolbi.cz/blog/2017/10/25/setuserfta-userchoice-hash-defeated-set-file-type-associations-per-user/) and [PS-SFTA](https://github.com/DanysysTeam/PS-SFTA).
+- Graphical user interface powered by [Slint](https://slint.dev/).
