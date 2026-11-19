@@ -4,6 +4,12 @@ Versions follow the rule in the project brief: minor change -> bump the pre-rele
 medium change -> beta, major change -> next version number. The version lives only in
 `Cargo.toml`.
 
+## 0.1.0-beta.8 — 2026-11-19 — minor
+Add GitHub Actions installer workflow (`.github/workflows/build-installers.yml`) using Inno Setup
+(`installer/defaultfast.iss`) to package `DefaultFast-<version>-windows-x86_64.exe` on `v*` tags
+and manual runs, upload the `installers` artifact, publish GitHub Releases, and document releasing
+in `README.md`.
+
 ## 0.1.0-beta.7 — 2026-11-06 — medium
 Fix subtree duplication in backup coverage, multi-line .reg continuations, bare-dot and UTF-8
 word-boundary search, custom target persistence, list scrolling/bounds, and window placement;

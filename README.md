@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/projectGloria/DefaultFast/releases"><img src="https://img.shields.io/badge/version-0.1.0--beta.7-blue.svg" alt="Version 0.1.0-beta.7" /></a>
+  <a href="https://github.com/projectGloria/DefaultFast/releases"><img src="https://img.shields.io/badge/version-0.1.0--beta.8-blue.svg" alt="Version 0.1.0-beta.8" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20(1809%2B)%20%7C%2011-0078D4.svg" alt="Windows 10 1809+ / 11" />
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust 1.88+" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
@@ -28,6 +28,7 @@
   <a href="#usage">Usage</a> •
   <a href="#repair-and-safety">Repair &amp; Safety</a> •
   <a href="#building-from-source">Building from Source</a> •
+  <a href="#how-to-release">How to Release</a> •
   <a href="#diagnostics-and-budgets">Diagnostics &amp; Budgets</a> •
   <a href="#license">License</a>
 </p>
@@ -205,6 +206,20 @@ The compiled standalone executable is generated at:
 ```
 target\release\DefaultFast.exe
 ```
+
+## How to Release
+
+GitHub Actions (`.github/workflows/build-installers.yml`) automatically runs tests, builds the release binary, and packages a Windows x86_64 installer (`DefaultFast-<version>-windows-x86_64.exe`) using Inno Setup.
+
+1. Update the version in `Cargo.toml`, synchronize `Cargo.lock`, add a `CHANGELOG.md` entry, and commit your changes.
+2. Create and push a version tag:
+   ```bash
+   git tag v1.0.0
+   git push --tags
+   ```
+3. Download the built installer from:
+   - **GitHub Releases**: [Releases](https://github.com/projectGloria/DefaultFast/releases) (automatically created and attached on `v*` tag pushes; tags containing `-` such as `v0.1.0-beta.8` are marked as prereleases).
+   - **Workflow Artifacts**: Open the **Build Installers** run under the repository's **Actions** tab and download the **`installers`** artifact (also available for manual `workflow_dispatch` runs).
 
 ## Diagnostics and Budgets
 
